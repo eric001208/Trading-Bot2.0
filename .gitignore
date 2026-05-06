@@ -1,0 +1,11 @@
+.env
+*.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env.local
+logs/
+*.log
+data/*.csv
+data/*.xlsx
