@@ -736,10 +736,8 @@ async def _scan_market(
         return
 
     if not qualified:
-        await notifier.send_text(
-            f"观察型市场扫描：本轮没有发现评分达到 {score_threshold} 的候选备案。\n\n"
-            "系统已完成扫描，但没有推送入场观察备案。"
-        )
+        # 不达标不通知：常驻运行时避免刷屏，只在有“有效动作”时推送。
+        logger.info("本轮无达标候选（score_threshold=%s），不发送通知。", score_threshold)
         return
 
     trades = load_paper_trades(paper_path) if paper_record else []
