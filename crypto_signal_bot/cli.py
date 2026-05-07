@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,10 @@ from crypto_signal_bot.logging_setup import configure_logging
 from crypto_signal_bot.market import fetch_top_usdm_symbols_by_quote_volume, fetch_usdm_klines, fetch_usdm_klines_range
 from crypto_signal_bot.models import Candle
 from crypto_signal_bot.paper import (
+    CLOSED,
+    OPEN,
+    PENDING,
+    PaperTrade,
     export_paper_trades,
     load_paper_trades,
     paper_summary_zh,
@@ -179,6 +184,89 @@ def _threshold_for_candidate(
 
 def _opposite_direction(a: str, b: str) -> bool:
     return {a, b} == {"做多观察", "做空观察"}
+
+
+def _find_matching_active_trade(trades: Sequence[PaperTrade], candidate) -> PaperTrade | None:
+    symbol = candidate.symbol.strip().upper()
+    direction = candidate.direction
+    best: PaperTrade | None = None
+    best_time = -1
+    for trade in trades:
+        if trade.status not in {PENDING, OPEN}:
+            continue
+        if trade.symbol != symbol or trade.direction != direction:
+            continue
+        trigger_gap = abs(trade.trigger_price - candidate.trigger_price) / max(candidate.trigger_price, 1e-9)
+        stop_gap = abs(trade.stop_loss - candidate.stop_loss) / max(candidate.stop_loss, 1e-9)
+        if trigger_gap > 0.001 or stop_gap > 0.001:
+            continue
+        if trade.signal_time_ms > best_time:
+            best = trade
+            best_time = trade.signal_time_ms
+    return best
+
+
+def _format_ms_local(time_ms: int | None) -> str:
+    if not time_ms:
+        return "-"
+    return datetime.fromtimestamp(time_ms / 1000, UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _enhanced_confirmation_message(candidate, trade: PaperTrade) -> str:
+    status = "待触发" if trade.status == PENDING else "持仓中"
+    entry_hint = ""
+    if trade.status == OPEN and trade.entry_time_ms is not None:
+        entry_hint = f"\n入场价：{trade.entry_price:g}（{_format_ms_local(trade.entry_time_ms)}）"
+    pnl_hint = ""
+    if trade.status == OPEN and trade.entry_price > 0:
+        pnl_hint = f"\n浮动盈亏：{trade.unrealized_pnl_pct * 100:.2f}%（最新价 {trade.last_price:g}）"
+
+    return (
+        f"增强确认：{candidate.symbol} {candidate.direction}\n\n"
+        f"状态：{status}｜评分仍为 {candidate.score}/100\n"
+        f"当前价：{candidate.current_price:g}\n"
+        f"触发价：{candidate.trigger_price:g}\n"
+        f"止损：{candidate.stop_loss:g}\n"
+        f"TP1：{candidate.take_profit_1:g}｜TP2：{candidate.take_profit_2:g}\n"
+        f"建议持仓：约 {candidate.expected_hold_hours:g} 小时｜目标盈亏比 {candidate.target_rr:g}:1"
+        f"{entry_hint}{pnl_hint}\n\n"
+        "说明：该币种同方向信号与上次一致，本轮不重复发送开仓通知。"
+    )
+
+
+def _paper_event_messages(before: Sequence[PaperTrade], after: Sequence[PaperTrade]) -> list[str]:
+    before_by_id = {t.paper_id: t for t in before}
+    out: list[str] = []
+    for trade in after:
+        prev = before_by_id.get(trade.paper_id)
+        if prev is None:
+            continue
+        if not prev.tp1_hit and trade.tp1_hit:
+            out.append(
+                (
+                    f"TP1触发：{trade.symbol} {trade.direction}\n\n"
+                    f"入场：{trade.entry_price:g}｜TP1：{trade.tp1_price:g}\n"
+                    f"最新价：{trade.last_price:g}｜浮动：{trade.unrealized_pnl_pct * 100:.2f}%\n"
+                    f"当前止损(已抬高)：{trade.active_stop_price:g}\n"
+                    f"触发时间：{_format_ms_local(trade.tp1_time_ms)}\n\n"
+                    "建议：可以把止损抬到保本/小盈利区间，后续同币种同方向不再重复推送开仓提醒。"
+                )
+            )
+        if prev.status != CLOSED and trade.status == CLOSED:
+            extra = ""
+            if trade.outcome in {"到期平仓", "时间止损"} and not trade.tp1_hit:
+                extra = "\n\n建议：持仓超时且动能不足/横盘，建议离场并等待下一次高质量信号。"
+            out.append(
+                (
+                    f"平仓提醒：{trade.symbol} {trade.direction}\n\n"
+                    f"原因：{trade.outcome or '-'}\n"
+                    f"入场：{trade.entry_price:g}（{_format_ms_local(trade.entry_time_ms)}）\n"
+                    f"出场：{trade.exit_price:g}（{_format_ms_local(trade.exit_time_ms)}）\n"
+                    f"收益：{trade.pnl_pct * 100:.2f}%（含手续费/资金费率）"
+                    f"{extra}"
+                )
+            )
+    return out
 
 
 def _recent_return(candles: list[Candle], lookback: int = 6) -> float | None:
@@ -628,21 +716,23 @@ async def _scan_market(
         if candidate.score >= threshold:
             qualified.append(candidate)
 
+    recorded: list[PaperTrade] = []
+    if paper_record and qualified:
+        recorded = record_signal_candidates(
+            qualified,
+            paper_path,
+            confirm_minutes=confirm_minutes,
+            entry_mode=paper_entry_mode,
+            cooldown_minutes=symbol_cooldown_minutes,
+        )
+        logger.info(
+            "虚拟盘记录：新增 %s 条，重复/冷却跳过 %s 条，账本=%s",
+            len(recorded),
+            len(qualified) - len(recorded),
+            paper_path,
+        )
+
     if notifier is None:
-        if paper_record and qualified:
-            recorded = record_signal_candidates(
-                qualified,
-                paper_path,
-                confirm_minutes=confirm_minutes,
-                entry_mode=paper_entry_mode,
-                cooldown_minutes=symbol_cooldown_minutes,
-            )
-            logger.info(
-                "虚拟盘记录：新增 %s 条，重复跳过 %s 条，账本=%s",
-                len(recorded),
-                len(qualified) - len(recorded),
-                paper_path,
-            )
         return
 
     if not qualified:
@@ -652,29 +742,40 @@ async def _scan_market(
         )
         return
 
+    trades = load_paper_trades(paper_path) if paper_record else []
+    recorded_keys = {(t.symbol, t.direction) for t in recorded}
+    entry_messages: list[str] = []
+    confirm_messages: list[str] = []
+    suppressed = 0
+    for candidate in qualified:
+        key = (candidate.symbol.strip().upper(), candidate.direction)
+        if key in recorded_keys:
+            entry_messages.append(candidate.to_telegram_message())
+            continue
+        if not paper_record:
+            entry_messages.append(candidate.to_telegram_message())
+            continue
+        matched = _find_matching_active_trade(trades, candidate)
+        if matched is not None and not matched.tp1_hit:
+            confirm_messages.append(_enhanced_confirmation_message(candidate, matched))
+        else:
+            suppressed += 1
+
     await notifier.send_text(
         f"观察型市场扫描完成\n"
         f"观察池数量：{len(symbols)}\n"
         f"推送阈值：{score_threshold}\n"
-        f"达标备案：{len(qualified)}"
+        f"达标备案：{len(qualified)}\n"
+        f"新增开仓通知：{len(entry_messages)}\n"
+        f"增强确认：{len(confirm_messages)}"
     )
-    for candidate in qualified:
-        await notifier.send_text(candidate.to_telegram_message())
+    for msg in entry_messages:
+        await notifier.send_text(msg)
+    for msg in confirm_messages:
+        await notifier.send_text(msg)
 
-    if paper_record:
-        recorded = record_signal_candidates(
-            qualified,
-            paper_path,
-            confirm_minutes=confirm_minutes,
-            entry_mode=paper_entry_mode,
-            cooldown_minutes=symbol_cooldown_minutes,
-        )
-        logger.info(
-            "虚拟盘记录：新增 %s 条，重复跳过 %s 条，账本=%s",
-            len(recorded),
-            len(qualified) - len(recorded),
-            paper_path,
-        )
+    if suppressed:
+        logger.info("通知去重：抑制重复=%s", suppressed)
 
 
 async def _run_live_loop(
@@ -771,6 +872,7 @@ async def _run_live_loop(
                 await _notify_and_stop_on_network_error(notifier, exc, snap)
 
         try:
+            before_trades = load_paper_trades(paper_path)
             result = await sync_paper_trades(
                 paper_path,
                 fee_rate=fee_rate,
@@ -781,6 +883,9 @@ async def _run_live_loop(
                 trailing_trigger_pct=trailing_trigger_pct,
                 trailing_lock_pct=trailing_lock_pct,
             )
+            if notifier is not None and result.changed_count:
+                for msg in _paper_event_messages(before_trades, result.trades):
+                    await notifier.send_text(msg)
             now_utc = datetime.now(UTC)
             exported: Path | None = None
             if export_every == 0:
