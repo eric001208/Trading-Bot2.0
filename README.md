@@ -83,6 +83,7 @@ python main.py --scan-market --score-threshold 90 --notify
 ```powershell
 python main.py --run-live `
   --loop-minutes 5 `
+  --market-summary-every-scans 12 `
   --score-threshold 90 `
   --paper-record `
   --paper-path paper_trades.json `
@@ -94,6 +95,11 @@ python main.py --run-live `
 
 行为说明：
 
+- 每隔 `--market-summary-every-scans` 轮扫描会发送一条“市场总结”（默认 12；当 `--loop-minutes=5` 时约等于每小时一次），包含每个币的：
+  - 结构判断：上升/下跌/横盘（基于 1h EMA20/EMA50 结构）
+  - 6h/24h 涨跌幅
+  - 24h 估算成交额（由 K 线成交量 * 收盘价近似）
+  - 当前 1h 量能相对近 20h 均值倍数
 - 程序遇到网络异常（例如断网、请求失败等）时：
   1. 会把当前模拟盘账本导出一份“最终快照”到 `paper_snapshots/`
   2. 如果开启了 `--notify`，会发 Telegram 告警

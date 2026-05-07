@@ -13,6 +13,7 @@ import httpx
 from crypto_signal_bot.alerts import TelegramNotifier
 from crypto_signal_bot.backtest import BacktestSummary, export_backtest_trades_csv, run_observation_backtest
 from crypto_signal_bot.config import Settings
+from crypto_signal_bot.indicators import closes, ema, ema_slope
 from crypto_signal_bot.logging_setup import configure_logging
 from crypto_signal_bot.market import fetch_top_usdm_symbols_by_quote_volume, fetch_usdm_klines, fetch_usdm_klines_range
 from crypto_signal_bot.models import Candle
@@ -288,6 +289,87 @@ def _day_from_ms(time_ms: int) -> str:
 
 def _quote_volume(candle: Candle) -> float:
     return candle.volume * candle.close
+
+
+def _format_big_number(value: float | None, *, digits: int = 2) -> str:
+    if value is None:
+        return "-"
+    v = float(value)
+    abs_v = abs(v)
+    if abs_v >= 1_000_000_000_000:
+        return f"{v / 1_000_000_000_000:.{digits}f}T"
+    if abs_v >= 1_000_000_000:
+        return f"{v / 1_000_000_000:.{digits}f}B"
+    if abs_v >= 1_000_000:
+        return f"{v / 1_000_000:.{digits}f}M"
+    if abs_v >= 1_000:
+        return f"{v / 1_000:.{digits}f}K"
+    return f"{v:.{digits}f}"
+
+
+def _closed_candles(candles: list[Candle]) -> list[Candle]:
+    """Drop the current still-forming bar when REST returns it (close_time in the future)."""
+    if len(candles) < 2:
+        return list(candles)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    if candles[-1].close_time > now_ms:
+        return list(candles[:-1])
+    return list(candles)
+
+
+def _market_state_zh(trend_candles: list[Candle]) -> str:
+    """Rough structure classification for hourly market summary: 上升/下跌/横盘."""
+    candles = _closed_candles(trend_candles)
+    closes_ = closes(candles)
+    e20 = ema(closes_, 20)
+    e50 = ema(closes_, 50)
+    s20 = ema_slope(closes_, 20, 3)
+    s50 = ema_slope(closes_, 50, 3)
+    if None in {e20, e50, s20, s50}:
+        return "未知"
+    price = candles[-1].close
+    # 与策略里的趋势过滤保持一致：允许极轻微回撤，只要结构仍然偏多/偏空。
+    eps20 = (e20 or 0.0) * 0.00012
+    eps50 = (e50 or 0.0) * 0.00008
+    if price > (e20 or 0.0) and (e20 or 0.0) >= (e50 or 0.0) and (s20 or 0.0) > -eps20 and (s50 or 0.0) > -eps50:
+        return "上升"
+    if price < (e20 or 0.0) and (e20 or 0.0) <= (e50 or 0.0) and (s20 or 0.0) < eps20 and (s50 or 0.0) < eps50:
+        return "下跌"
+    return "横盘"
+
+
+def _market_summary_message(symbols: list[str], trend_by_symbol: dict[str, list[Candle]]) -> str:
+    now_local = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    lines: list[str] = [
+        "每小时市场总结",
+        f"时间：{now_local}",
+        f"本轮观察池：{len(symbols)}",
+        "",
+    ]
+    for symbol in symbols:
+        candles = trend_by_symbol.get(symbol)
+        if not candles:
+            lines.append(f"{symbol}：数据缺失")
+            continue
+        closed = _closed_candles(candles)
+        state = _market_state_zh(closed)
+        last_price = closed[-1].close if closed else candles[-1].close
+        r6 = _recent_return(closed, 6) if closed else None
+        r24 = _recent_return(closed, 24) if closed else None
+        vol24 = sum(_quote_volume(c) for c in (closed[-24:] if len(closed) >= 24 else closed))
+        # 1小时量能相对过去20小时均值倍数
+        vol1 = _quote_volume(closed[-1]) if closed else _quote_volume(candles[-1])
+        base = None
+        if len(closed) >= 20:
+            avg20 = sum(_quote_volume(c) for c in closed[-20:]) / 20.0
+            if avg20 > 0:
+                base = vol1 / avg20
+        r6s = "-" if r6 is None else f"{r6 * 100:+.2f}%"
+        r24s = "-" if r24 is None else f"{r24 * 100:+.2f}%"
+        vol24s = _format_big_number(vol24, digits=2)
+        mults = "-" if base is None else f"{base:.2f}x"
+        lines.append(f"{symbol}：{state}｜现价 {last_price:g}｜6h {r6s}｜24h {r24s}｜24h成交额 {vol24s}｜1h量能 {mults}")
+    return "\n".join(lines)
 
 
 def _daily_move_pct(candle: Candle) -> float:
@@ -601,6 +683,7 @@ async def _scan_market(
     paper_entry_mode: str,
     symbol_cooldown_minutes: int,
     notifier: TelegramNotifier | None,
+    send_market_summary: bool = False,
 ) -> None:
     top_symbols = await fetch_top_usdm_symbols_by_quote_volume(limit=top_volume_limit)
     dynamic_alt_candidates = await _select_dynamic_alt_candidates(
@@ -661,6 +744,14 @@ async def _scan_market(
         )
         logger.info(candidate.summary_line())
         candidates[symbol] = candidate
+
+    summary_msg: str | None = None
+    if send_market_summary and notifier is not None:
+        try:
+            summary_msg = _market_summary_message(symbols, trend_by_symbol)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("市场总结生成失败：%s", exc)
+            summary_msg = None
 
     qualified = []
     btc_candidate = candidates.get("BTCUSDT")
@@ -734,6 +825,9 @@ async def _scan_market(
 
     if notifier is None:
         return
+
+    if summary_msg is not None:
+        await notifier.send_text(summary_msg)
 
     if not qualified:
         # 不达标不通知：常驻运行时避免刷屏，只在有“有效动作”时推送。
@@ -810,6 +904,7 @@ async def _run_live_loop(
     paper_export_every_hours: int,
     paper_snapshot_dir: str,
     loop_minutes: int,
+    market_summary_every_scans: int,
     symbol_cooldown_minutes: int,
     fee_rate: float,
     funding_rate_8h: float,
@@ -830,6 +925,11 @@ async def _run_live_loop(
         loop_no += 1
         logger.info("常驻运行第 %s 轮开始（UTC=%s）", loop_no, datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"))
         try:
+            send_summary = (
+                notifier is not None
+                and market_summary_every_scans > 0
+                and loop_no % market_summary_every_scans == 0
+            )
             await _scan_market(
                 fixed_symbols=fixed_symbols,
                 top_volume_limit=top_volume_limit,
@@ -862,6 +962,7 @@ async def _run_live_loop(
                 paper_entry_mode=paper_entry_mode,
                 symbol_cooldown_minutes=symbol_cooldown_minutes,
                 notifier=notifier,
+                send_market_summary=send_summary,
             )
         except Exception as exc:
             logger.exception("常驻运行扫描失败：%s", exc)
@@ -1381,6 +1482,12 @@ def main() -> None:
         default=5,
         help="常驻运行循环间隔分钟数，默认5",
     )
+    parser.add_argument(
+        "--market-summary-every-scans",
+        type=int,
+        default=12,
+        help="常驻运行：每N轮扫描发送一次市场总结（0关闭）。默认12（当 --loop-minutes=5 时约等于每小时一次）",
+    )
     args = parser.parse_args()
 
     settings = Settings.from_env()
@@ -1611,6 +1718,7 @@ def main() -> None:
                     paper_export_every_hours=args.paper_export_every_hours,
                     paper_snapshot_dir=args.paper_snapshot_dir,
                     loop_minutes=args.loop_minutes,
+                    market_summary_every_scans=args.market_summary_every_scans,
                     symbol_cooldown_minutes=args.symbol_cooldown_minutes,
                     fee_rate=args.fee_rate,
                     funding_rate_8h=args.funding_rate_8h,
