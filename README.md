@@ -70,6 +70,12 @@ python main.py --scan-market --score-threshold 90 --notify
 - `--paper-record --paper-path paper_trades.json`：把达到阈值的信号写入模拟盘账本
 - `--paper-entry-mode immediate|confirm`：模拟盘入场方式（默认 `immediate`）
 
+通知去重与增强确认（推荐开启 `--paper-record`）：
+
+- 同一币种同方向“相同信号”（触发价/止损几乎一致）只会发送一次完整开仓通知
+- 后续再次扫到相同信号，会改为发送“增强确认”提醒（不再刷屏）
+- 当 TP1 触发或平仓（止损/时间止损/到期平仓/移动止损等）时，会在常驻运行的同步阶段推送事件通知
+
 ### 2) 常驻运行（推荐：扫描 + 模拟盘 + 定时导出）
 
 下面这条会每 5 分钟扫描一次，并把信号写入模拟盘；模拟盘会每 24 小时导出一次表格：
