@@ -165,6 +165,10 @@ def _trend_slice_for_time(trend: Sequence[Candle], close_time_ms: int) -> list[C
     return [c for c in trend if c.close_time <= close_time_ms]
 
 
+def _entry_slice_for_time(entry: Sequence[Candle], close_time_ms: int) -> list[Candle]:
+    return [c for c in entry if c.close_time <= close_time_ms]
+
+
 def _pnl_pct(direction: str, entry: float, exit_price: float, fee_rate: float) -> float:
     gross = (exit_price - entry) / entry
     if direction == "做空观察":
@@ -615,6 +619,8 @@ def _has_conflicting_market_signal(
             expected_hold_hours=hold_hours,
             target_rr=target_rr,
             expires_after_minutes=expire_minutes,
+            hard_volume_filter=False,
+            hard_short_trend_filter=False,
         )
         if (
             btc_candidate.score >= conflict_threshold
@@ -679,6 +685,11 @@ def run_observation_backtest_from_candles(
             if market_trend_candles is not None
             else None
         )
+        market_entry_slice = (
+            _entry_slice_for_time(market_entry_candles, entry_candles[i].close_time)
+            if market_entry_candles is not None
+            else None
+        )
         if len(trend_slice) < 120:
             i += 1
             continue
@@ -694,6 +705,7 @@ def run_observation_backtest_from_candles(
             target_rr=target_rr,
             expires_after_minutes=expire_minutes,
             market_candles=market_slice,
+            market_entry_candles=market_entry_slice,
             weekly_filter=weekly_filter,
         )
         if allowed_directions is not None and candidate.direction not in allowed_directions:
@@ -889,53 +901,75 @@ async def run_observation_backtest(
 
 
 def export_backtest_trades_csv(summaries: Sequence[BacktestSummary], path: str | Path) -> Path:
+    """
+    Export backtest trades with Excel-friendly headers and readable timestamps.
+
+    Notes:
+    - We keep timestamps in both UTC and local time (based on the machine's timezone) to avoid confusion.
+    - We intentionally DO NOT include raw millisecond timestamps to prevent Excel from displaying 1.78E+12.
+    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "symbol",
-                "direction",
-                "score",
-                "entry_time_ms",
-                "exit_time_ms",
-                "entry_price",
-                "exit_price",
-                "stop_loss",
-                "tp1_price",
-                "final_target_price",
-                "trailing_stop_price",
-                "trailing_stop_activated",
-                "planned_hold_hours",
-                "funding_cost_pct",
-                "tp1_hit",
-                "outcome",
-                "pnl_pct",
+                "交易对",
+                "方向",
+                "评分",
+                "入场时间(本地)",
+                "出场时间(本地)",
+                "入场时间(UTC)",
+                "出场时间(UTC)",
+                "入场价",
+                "出场价",
+                "止损价",
+                "TP1(1R)",
+                "目标价",
+                "移动止损触发",
+                "移动止损价",
+                "计划持仓(小时)",
+                "资金费率成本(%)",
+                "TP1已触发",
+                "出场原因",
+                "收益率(%)",
             ],
         )
         writer.writeheader()
         for summary in summaries:
             for trade in summary.trades:
+                entry_utc = datetime.fromtimestamp(trade.entry_time_ms / 1000, UTC)
+                exit_utc = datetime.fromtimestamp(trade.exit_time_ms / 1000, UTC)
+                # Avoid depending on tzdata on Windows: use the host machine's local timezone.
+                entry_local = entry_utc.astimezone()
+                exit_local = exit_utc.astimezone()
+
+                entry_utc_text = entry_utc.isoformat(sep=" ", timespec="seconds")
+                exit_utc_text = exit_utc.isoformat(sep=" ", timespec="seconds")
+                entry_local_text = entry_local.isoformat(sep=" ", timespec="seconds")
+                exit_local_text = exit_local.isoformat(sep=" ", timespec="seconds")
+
                 writer.writerow(
                     {
-                        "symbol": trade.symbol,
-                        "direction": trade.direction,
-                        "score": trade.score,
-                        "entry_time_ms": trade.entry_time_ms,
-                        "exit_time_ms": trade.exit_time_ms,
-                        "entry_price": trade.entry_price,
-                        "exit_price": trade.exit_price,
-                        "stop_loss": trade.stop_loss,
-                        "tp1_price": trade.tp1_price,
-                        "final_target_price": trade.final_target_price,
-                        "trailing_stop_price": trade.trailing_stop_price,
-                        "trailing_stop_activated": trade.trailing_stop_activated,
-                        "planned_hold_hours": trade.planned_hold_hours,
-                        "funding_cost_pct": trade.funding_cost_pct,
-                        "tp1_hit": trade.tp1_hit,
-                        "outcome": trade.outcome,
-                        "pnl_pct": trade.pnl_pct,
+                        "交易对": trade.symbol,
+                        "方向": trade.direction,
+                        "评分": trade.score,
+                        "入场时间(本地)": entry_local_text,
+                        "出场时间(本地)": exit_local_text,
+                        "入场时间(UTC)": entry_utc_text,
+                        "出场时间(UTC)": exit_utc_text,
+                        "入场价": trade.entry_price,
+                        "出场价": trade.exit_price,
+                        "止损价": trade.stop_loss,
+                        "TP1(1R)": trade.tp1_price,
+                        "目标价": trade.final_target_price,
+                        "移动止损触发": trade.trailing_stop_activated,
+                        "移动止损价": trade.trailing_stop_price,
+                        "计划持仓(小时)": trade.planned_hold_hours,
+                        "资金费率成本(%)": round(trade.funding_cost_pct * 100, 6),
+                        "TP1已触发": trade.tp1_hit,
+                        "出场原因": trade.outcome,
+                        "收益率(%)": round(trade.pnl_pct * 100, 6),
                     }
                 )
     return out
