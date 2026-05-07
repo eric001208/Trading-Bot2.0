@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from crypto_signal_bot.indicators import ma25, ma99, volume_ma
+from crypto_signal_bot.indicators import closes, ema, ema_slope, ma25, ma99, volume_ma
 from crypto_signal_bot.models import Candle
 
 MIN_TREND_BARS = 120
@@ -12,6 +12,8 @@ SIDEWAYS_EXCEPTION_SCORE = 95
 SIDEWAYS_SCORE_PENALTY = 5
 MIN_POSITION_SPACE_R = 1.2
 GOOD_POSITION_SPACE_R = 2.0
+SHORT_TREND_EMA_LOOKBACK = 1
+MIN_VOLUME_SPIKE_RATIO = 1.2
 
 
 @dataclass(frozen=True)
@@ -244,6 +246,51 @@ def _ma25_slope(candles: Sequence[Candle]) -> float:
     prev = sum(c.close for c in candles[-50:-25]) / 25
     now = sum(c.close for c in candles[-25:]) / 25
     return now - prev
+
+
+def _short_term_trend_ok(
+    candles: Sequence[Candle],
+    direction: str,
+    *,
+    reference_price: float | None = None,
+) -> tuple[bool, str]:
+    closes_ = closes(candles)
+    e20 = ema(closes_, 20)
+    e50 = ema(closes_, 50)
+    s20 = ema_slope(closes_, 20, SHORT_TREND_EMA_LOOKBACK)
+    s50 = ema_slope(closes_, 50, SHORT_TREND_EMA_LOOKBACK)
+    if None in {e20, e50, s20, s50}:
+        return False, "短周期EMA指标未就绪"
+    last = candles[-1].close
+    price = reference_price if reference_price is not None else last
+    # EMA 斜率在拐点附近容易出现很小的负值，这里允许轻微回撤，只要结构仍然向上。
+    eps20 = (e20 or 0.0) * 0.00012
+    eps50 = (e50 or 0.0) * 0.00008
+    if direction == "做多观察":
+        ok = price > e20 and e20 >= e50 and s20 > -eps20 and s50 > -eps50
+        detail = (
+            f"EMA20/50结构：price={price:g} close={last:g} EMA20={e20:.4g} EMA50={e50:.4g} "
+            f"slope20={s20:.4g} slope50={s50:.4g}"
+        )
+        return ok, detail
+    if direction == "做空观察":
+        ok = price < e20 and e20 <= e50 and s20 < eps20 and s50 < eps50
+        detail = (
+            f"EMA20/50结构：price={price:g} close={last:g} EMA20={e20:.4g} EMA50={e50:.4g} "
+            f"slope20={s20:.4g} slope50={s50:.4g}"
+        )
+        return ok, detail
+    return False, "方向非法"
+
+
+def _volume_spike_ok(entry_candles: Sequence[Candle], ratio: float = MIN_VOLUME_SPIKE_RATIO) -> tuple[bool, str]:
+    vma = volume_ma(entry_candles, 20)
+    if vma is None or vma <= 0:
+        return False, "成交量均值未就绪"
+    last_v = entry_candles[-1].volume
+    multiple = last_v / vma
+    ok = multiple >= ratio
+    return ok, f"成交量放大：{multiple:.2f}x（阈值 {ratio:.2f}x）"
 
 
 def _pct_change(candles: Sequence[Candle], lookback: int) -> float | None:
@@ -733,6 +780,10 @@ def _score_candidate_direction(
     assert adx is not None
 
     score = 0.0
+    trend_pts = 0.0
+    momentum_pts = 0.0
+    volume_pts = 0.0
+    risk_pts = 0.0
     reasons: list[str] = []
 
     slope = _ma25_slope(trend_candles)
@@ -743,12 +794,15 @@ def _score_candidate_direction(
 
     if ma_alignment:
         score += 12
+        trend_pts += 12
         reasons.append("1h MA25 与 MA99 排列支持当前方向。")
     if trend_ok:
         score += 12
+        trend_pts += 12
         reasons.append("1h 价格位于 MA99 的有利方向，过滤掉一部分逆势交易。")
     if ma25_ok and slope_ok:
         score += 10
+        trend_pts += 10
         reasons.append("1h 短中期方向和均线斜率一致。")
 
     recent = entry_candles[-16:-1]
@@ -758,10 +812,12 @@ def _score_candidate_direction(
 
     if 0.003 <= range_pct <= 0.035:
         score += 8
+        risk_pts += 8
         reasons.append("15m 近期波动区间适中，止损和目标更容易设计。")
 
     if adx >= 18:
         score += 8
+        momentum_pts += 8
         reasons.append("15m ADX 显示有一定趋势强度，减少纯震荡假突破。")
     elif adx < 12:
         reasons.append("15m ADX 偏低，市场偏震荡，候选质量降低。")
@@ -774,15 +830,19 @@ def _score_candidate_direction(
         above_range_mid = entry_last.close >= (recent_range_high + recent_range_low) / 2
         if pulled_back:
             score += 20
+            momentum_pts += 20
             reasons.append("15m 有回踩均线或结构区的动作，不是单纯追高。")
         if not_overheated:
             score += 10
+            momentum_pts += 10
             reasons.append("15m RSI 处于相对健康区间，暂未明显过热。")
         if entry_last.close >= entry_ma25:
             score += 8
+            momentum_pts += 8
             reasons.append("15m 当前价格已经重新靠近或站上 MA25。")
         if above_range_mid:
             score += 8
+            momentum_pts += 8
             reasons.append("15m 价格回到近期结构中轴上方，突破触发更有意义。")
     else:
         pulled_back = recent_range_high >= entry_ma25 * 0.996 or recent_range_high >= entry_ma99 * 0.99
@@ -792,31 +852,39 @@ def _score_candidate_direction(
         below_range_mid = entry_last.close <= (recent_range_high + recent_range_low) / 2
         if pulled_back:
             score += 20
+            momentum_pts += 20
             reasons.append("15m 有反弹到均线或结构区的动作，不是单纯追空。")
         if not_overheated:
             score += 10
+            momentum_pts += 10
             reasons.append("15m RSI 处于相对健康区间，暂未明显超跌。")
         if entry_last.close <= entry_ma25:
             score += 8
+            momentum_pts += 8
             reasons.append("15m 当前价格已经重新靠近或跌回 MA25 下方。")
         if below_range_mid:
             score += 8
+            momentum_pts += 8
             reasons.append("15m 价格回到近期结构中轴下方，跌破触发更有意义。")
 
     if 0.0004 <= trigger_gap <= 0.006:
         score += 10
+        momentum_pts += 10
         reasons.append("触发价距离当前价格不远，适合短时间确认。")
     elif trigger_gap <= 0.012:
         score += 5
+        momentum_pts += 5
         reasons.append("触发价略远，需要等待更明确的突破确认。")
     else:
         reasons.append("触发价距离偏远，本轮候选质量降低。")
 
     if entry_last.volume >= 1.25 * vma:
         score += 12
+        volume_pts += 12
         reasons.append("15m 成交量明显高于近20根均量，参与度较高。")
     elif entry_last.volume >= 0.9 * vma:
         score += 8
+        volume_pts += 8
         reasons.append("15m 成交量不弱，具备基本确认。")
 
     stop, tp1, tp2 = _build_candidate_prices(
@@ -830,9 +898,11 @@ def _score_candidate_direction(
     risk_pct = abs(trigger - stop) / trigger
     if 0.0025 <= risk_pct <= 0.014:
         score += 10
+        risk_pts += 10
         reasons.append("止损距离相对合理，能支持更高盈亏比。")
     elif risk_pct <= 0.022:
         score += 5
+        risk_pts += 5
         reasons.append("止损略宽，若触发也应降低仓位。")
     else:
         reasons.append("止损距离偏宽，候选质量降低。")
@@ -844,6 +914,7 @@ def _score_candidate_direction(
         stop_loss=stop,
     )
     score += position.score_adjustment
+    risk_pts += position.score_adjustment
     if position.score_adjustment > 0:
         reasons.append(f"位置过滤加分：{position.detail}")
     elif position.score_adjustment < 0:
@@ -864,7 +935,10 @@ def _score_candidate_direction(
         dynamic_hold=dynamic_hold,
     )
     reasons.append(f"持仓时间因子：{hold_plan.detail}")
-    final_score = _clamp_score(score)
+    final_score = min(99, _clamp_score(score))
+    reasons.append(
+        f"评分拆分：趋势={trend_pts:.0f} 动量={momentum_pts:.0f} 成交量={volume_pts:.0f} 风险={risk_pts:.0f} 总分={final_score}/99"
+    )
 
     return ObservationCandidate(
         symbol=symbol.strip().upper(),
@@ -895,7 +969,10 @@ def evaluate_observation_candidate(
     target_rr: float = 2.0,
     expires_after_minutes: int = 20,
     market_candles: Sequence[Candle] | None = None,
+    market_entry_candles: Sequence[Candle] | None = None,
     weekly_filter: bool = True,
+    hard_volume_filter: bool = True,
+    hard_short_trend_filter: bool = True,
 ) -> ObservationCandidate:
     if len(trend_candles) < MIN_TREND_BARS or len(entry_candles) < MIN_ENTRY_BARS:
         price = entry_candles[-1].close if entry_candles else 0.0
@@ -935,6 +1012,39 @@ def evaluate_observation_candidate(
         expires_after_minutes=expires_after_minutes,
     )
     candidate = long_candidate if long_candidate.score >= short_candidate.score else short_candidate
+
+    if hard_volume_filter and candidate.direction in {"做多观察", "做空观察"}:
+        ok, detail = _volume_spike_ok(entry_candles)
+        if not ok:
+            return replace(
+                candidate,
+                score=min(candidate.score, 59),
+                level="暂不关注",
+                reasons=candidate.reasons + (f"成交量过滤：{detail}，不满足放量要求，本轮作废。",),
+            )
+
+    if hard_short_trend_filter and candidate.direction == "做多观察" and symbol != "BTCUSDT":
+        ok, detail = _short_term_trend_ok(
+            entry_candles,
+            candidate.direction,
+            reference_price=candidate.trigger_price,
+        )
+        if not ok:
+            return replace(
+                candidate,
+                score=min(candidate.score, 59),
+                level="暂不关注",
+                reasons=candidate.reasons + (f"短周期趋势过滤：{detail}，币种未处于EMA上升结构，本轮作废。",),
+            )
+        if symbol != "BTCUSDT" and market_entry_candles is not None:
+            btc_ok, btc_detail = _short_term_trend_ok(market_entry_candles, "做多观察")
+            if not btc_ok:
+                return replace(
+                    candidate,
+                    score=min(candidate.score, 59),
+                    level="暂不关注",
+                    reasons=candidate.reasons + (f"BTC短周期趋势过滤：{btc_detail}，BTC未处于EMA上升结构，本轮作废。",),
+                )
 
     if weekly_filter and candidate.direction in {"做多观察", "做空观察"}:
         weekly = classify_weekly_trend(trend_candles)

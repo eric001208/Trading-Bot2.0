@@ -5,7 +5,15 @@ __pycache__/
 .venv/
 venv/
 .env.local
+.pytest_cache/
 logs/
 *.log
 data/*.csv
 data/*.xlsx
+
+# Generated outputs (keep repo clean)
+backtest_trades*.csv
+paper_trades.csv
+paper_trades.json
+paper_snapshots/
+tmp/

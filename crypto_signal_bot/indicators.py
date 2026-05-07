@@ -15,6 +15,29 @@ def sma(values: Sequence[float], period: int) -> float | None:
     return sum(window) / period
 
 
+def ema(values: Sequence[float], period: int) -> float | None:
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    seed = sma(values[:period], period)
+    if seed is None:
+        return None
+    e = seed
+    for v in values[period:]:
+        e = (v - e) * k + e
+    return e
+
+
+def ema_slope(values: Sequence[float], period: int, lookback: int = 3) -> float | None:
+    if lookback <= 0 or period <= 0 or len(values) < period + lookback:
+        return None
+    now = ema(values, period)
+    prev = ema(values[: -lookback], period)
+    if now is None or prev is None:
+        return None
+    return now - prev
+
+
 def closes(candles: Sequence[Candle]) -> list[float]:
     return [c.close for c in candles]
 

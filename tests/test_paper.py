@@ -52,6 +52,22 @@ def test_record_signal_candidate_creates_pending_trade_and_dedupes(tmp_path) -> 
     assert trades[0].expires_at_ms == 20 * 60_000
 
 
+def test_immediate_entry_mode_opens_trade_at_signal_price(tmp_path) -> None:
+    path = tmp_path / "paper.json"
+    recorded = record_signal_candidates(
+        [_candidate()],
+        path,
+        signal_time_ms=0,
+        confirm_minutes=10,
+        entry_mode="immediate",
+    )
+    trade = recorded[0]
+
+    assert trade.status == OPEN
+    assert trade.entry_time_ms == 0
+    assert trade.entry_price == 100.0
+
+
 def test_pending_trade_opens_when_trigger_is_confirmed(tmp_path) -> None:
     path = tmp_path / "paper.json"
     trade = record_signal_candidates([_candidate()], path, signal_time_ms=0, confirm_minutes=10)[0]

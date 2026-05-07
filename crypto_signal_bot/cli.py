@@ -6,6 +6,8 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import httpx
 
 from crypto_signal_bot.alerts import TelegramNotifier
 from crypto_signal_bot.backtest import BacktestSummary, export_backtest_trades_csv, run_observation_backtest
@@ -13,7 +15,13 @@ from crypto_signal_bot.config import Settings
 from crypto_signal_bot.logging_setup import configure_logging
 from crypto_signal_bot.market import fetch_top_usdm_symbols_by_quote_volume, fetch_usdm_klines, fetch_usdm_klines_range
 from crypto_signal_bot.models import Candle
-from crypto_signal_bot.paper import load_paper_trades, paper_summary_zh, record_signal_candidates, sync_paper_trades
+from crypto_signal_bot.paper import (
+    export_paper_trades,
+    load_paper_trades,
+    paper_summary_zh,
+    record_signal_candidates,
+    sync_paper_trades,
+)
 from crypto_signal_bot.strategies import evaluate_observation_candidate, evaluate_pullback_long
 
 logger = logging.getLogger(__name__)
@@ -502,6 +510,8 @@ async def _scan_market(
     paper_record: bool,
     paper_path: str,
     confirm_minutes: int,
+    paper_entry_mode: str,
+    symbol_cooldown_minutes: int,
     notifier: TelegramNotifier | None,
 ) -> None:
     top_symbols = await fetch_top_usdm_symbols_by_quote_volume(limit=top_volume_limit)
@@ -527,9 +537,12 @@ async def _scan_market(
     symbols = _dedupe_symbols(fixed_symbols + top_symbols + dynamic_alt_symbols)
     logger.info("本轮观察池：%s", "，".join(symbols))
     market_candles = None
+    market_entry_candles = None
     if any(symbol != "BTCUSDT" for symbol in symbols):
         btc_market_klines = await fetch_usdm_klines(symbol="BTCUSDT", interval="1h", limit=360)
         market_candles = [Candle.from_kline(k) for k in btc_market_klines]
+        btc_entry_klines = await fetch_usdm_klines(symbol="BTCUSDT", interval="15m", limit=180)
+        market_entry_candles = [Candle.from_kline(k) for k in btc_entry_klines]
 
     candidates = {}
     trend_by_symbol: dict[str, list[Candle]] = {}
@@ -555,6 +568,7 @@ async def _scan_market(
             target_rr=target_rr,
             expires_after_minutes=expire_minutes,
             market_candles=None if symbol == "BTCUSDT" else market_candles,
+            market_entry_candles=None if symbol == "BTCUSDT" else market_entry_candles,
             weekly_filter=weekly_filter,
         )
         logger.info(candidate.summary_line())
@@ -620,6 +634,8 @@ async def _scan_market(
                 qualified,
                 paper_path,
                 confirm_minutes=confirm_minutes,
+                entry_mode=paper_entry_mode,
+                cooldown_minutes=symbol_cooldown_minutes,
             )
             logger.info(
                 "虚拟盘记录：新增 %s 条，重复跳过 %s 条，账本=%s",
@@ -650,6 +666,8 @@ async def _scan_market(
             qualified,
             paper_path,
             confirm_minutes=confirm_minutes,
+            entry_mode=paper_entry_mode,
+            cooldown_minutes=symbol_cooldown_minutes,
         )
         logger.info(
             "虚拟盘记录：新增 %s 条，重复跳过 %s 条，账本=%s",
@@ -657,6 +675,185 @@ async def _scan_market(
             len(qualified) - len(recorded),
             paper_path,
         )
+
+
+async def _run_live_loop(
+    *,
+    fixed_symbols: list[str],
+    top_volume_limit: int,
+    score_threshold: int,
+    expected_hold_hours: float,
+    min_hold_hours: float,
+    max_hold_hours: float,
+    dynamic_hold: bool,
+    target_rr: float,
+    expire_minutes: int,
+    symbol_thresholds: dict[str, int],
+    direction_thresholds: dict[tuple[str, str], int],
+    dynamic_alt_limit: int,
+    dynamic_alt_top_limit: int,
+    dynamic_alt_lookback_days: int,
+    dynamic_alt_volume_ratio: float,
+    dynamic_alt_min_quote_volume: float,
+    dynamic_alt_min_daily_move_pct: float,
+    dynamic_alt_max_daily_move_pct: float,
+    dynamic_alt_min_daily_range_pct: float,
+    dynamic_alt_max_daily_range_pct: float,
+    dynamic_alt_threshold: int,
+    dynamic_alt_long_only: bool,
+    conflict_threshold: int,
+    relative_rank_limit: int,
+    weekly_filter: bool,
+    paper_path: str,
+    paper_entry_mode: str,
+    confirm_minutes: int,
+    paper_export_path: str,
+    paper_export_every_hours: int,
+    paper_snapshot_dir: str,
+    loop_minutes: int,
+    symbol_cooldown_minutes: int,
+    fee_rate: float,
+    funding_rate_8h: float,
+    time_stop_minutes: int,
+    min_progress_r: float,
+    r_trailing_enabled: bool,
+    trailing_trigger_pct: float,
+    trailing_lock_pct: float,
+    notifier: TelegramNotifier | None,
+) -> None:
+    logger.info("常驻运行已启动：间隔=%s分钟；虚拟盘=%s；导出=%s", loop_minutes, paper_path, paper_export_path)
+    snapshot_dir = Path(paper_snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    export_every = max(0, int(paper_export_every_hours))
+    next_export_at = datetime.now(UTC) + timedelta(hours=export_every) if export_every else None
+    loop_no = 0
+    while True:
+        loop_no += 1
+        logger.info("常驻运行第 %s 轮开始（UTC=%s）", loop_no, datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            await _scan_market(
+                fixed_symbols=fixed_symbols,
+                top_volume_limit=top_volume_limit,
+                score_threshold=score_threshold,
+                expected_hold_hours=expected_hold_hours,
+                min_hold_hours=min_hold_hours,
+                max_hold_hours=max_hold_hours,
+                dynamic_hold=dynamic_hold,
+                target_rr=target_rr,
+                expire_minutes=expire_minutes,
+                symbol_thresholds=symbol_thresholds,
+                direction_thresholds=direction_thresholds,
+                dynamic_alt_limit=dynamic_alt_limit,
+                dynamic_alt_top_limit=dynamic_alt_top_limit,
+                dynamic_alt_lookback_days=dynamic_alt_lookback_days,
+                dynamic_alt_volume_ratio=dynamic_alt_volume_ratio,
+                dynamic_alt_min_quote_volume=dynamic_alt_min_quote_volume,
+                dynamic_alt_min_daily_move_pct=dynamic_alt_min_daily_move_pct,
+                dynamic_alt_max_daily_move_pct=dynamic_alt_max_daily_move_pct,
+                dynamic_alt_min_daily_range_pct=dynamic_alt_min_daily_range_pct,
+                dynamic_alt_max_daily_range_pct=dynamic_alt_max_daily_range_pct,
+                dynamic_alt_threshold=dynamic_alt_threshold,
+                dynamic_alt_long_only=dynamic_alt_long_only,
+                conflict_threshold=conflict_threshold,
+                relative_rank_limit=relative_rank_limit,
+                weekly_filter=weekly_filter,
+                paper_record=True,
+                paper_path=paper_path,
+                confirm_minutes=confirm_minutes,
+                paper_entry_mode=paper_entry_mode,
+                symbol_cooldown_minutes=symbol_cooldown_minutes,
+                notifier=notifier,
+            )
+        except Exception as exc:
+            logger.exception("常驻运行扫描失败：%s", exc)
+            snap = _export_snapshot_on_issue(snapshot_dir, paper_export_path, paper_path, reason="scan_error")
+            if _is_network_error(exc):
+                await _notify_and_stop_on_network_error(notifier, exc, snap)
+
+        try:
+            result = await sync_paper_trades(
+                paper_path,
+                fee_rate=fee_rate,
+                funding_rate_8h=funding_rate_8h,
+                time_stop_minutes=time_stop_minutes,
+                min_progress_r=min_progress_r,
+                r_trailing_enabled=r_trailing_enabled,
+                trailing_trigger_pct=trailing_trigger_pct,
+                trailing_lock_pct=trailing_lock_pct,
+            )
+            now_utc = datetime.now(UTC)
+            exported: Path | None = None
+            if export_every == 0:
+                exported = export_paper_trades(paper_export_path, result.trades)
+            elif next_export_at is not None and now_utc >= next_export_at:
+                exported = export_paper_trades(_dated_export_path(paper_export_path, now_utc), result.trades)
+                next_export_at = now_utc + timedelta(hours=export_every)
+            if exported is not None:
+                logger.info("虚拟盘已同步：更新 %s 条；已导出：%s", result.changed_count, exported)
+            else:
+                logger.info("虚拟盘已同步：更新 %s 条；本轮未到导出时间", result.changed_count)
+        except Exception as exc:
+            logger.exception("常驻运行虚拟盘同步/导出失败：%s", exc)
+            snap = _export_snapshot_on_issue(snapshot_dir, paper_export_path, paper_path, reason="sync_error")
+            if _is_network_error(exc):
+                await _notify_and_stop_on_network_error(notifier, exc, snap)
+
+        next_run = datetime.now(UTC) + timedelta(minutes=loop_minutes)
+        logger.info("本轮结束，等待 %s 分钟后继续（预计UTC=%s）", loop_minutes, next_run.strftime("%Y-%m-%d %H:%M:%S"))
+        await asyncio.sleep(loop_minutes * 60)
+
+
+def _dated_export_path(base: str, now_utc: datetime) -> str:
+    p = Path(base)
+    stamp = now_utc.strftime("%Y-%m-%d")
+    return str(p.with_name(f"{p.stem}_{stamp}{p.suffix}"))
+
+
+def _timestamped_export_path(base: str, now_utc: datetime, reason: str) -> str:
+    p = Path(base)
+    stamp = now_utc.strftime("%Y-%m-%d_%H%M%S")
+    safe_reason = "".join(ch for ch in (reason or "snapshot") if ch.isalnum() or ch in {"_", "-"}).strip("_-")
+    suffix = f"_{safe_reason}" if safe_reason else ""
+    return str(p.with_name(f"{p.stem}_{stamp}{suffix}{p.suffix}"))
+
+
+def _export_snapshot_on_issue(snapshot_dir: Path, base_export_path: str, ledger_path: str, *, reason: str) -> Path | None:
+    try:
+        trades = load_paper_trades(ledger_path)
+        now_utc = datetime.now(UTC)
+        base = Path(base_export_path)
+        target = snapshot_dir / Path(_timestamped_export_path(base.name, now_utc, reason))
+        out = export_paper_trades(target, trades)
+        logger.info("检测到异常，已导出虚拟盘快照：%s", out)
+        return out
+    except Exception as exc:  # pragma: no cover
+        logger.warning("异常快照导出失败：%s", exc)
+        return None
+
+
+def _is_network_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+async def _notify_and_stop_on_network_error(
+    notifier: TelegramNotifier | None,
+    exc: Exception,
+    snapshot: Path | None,
+) -> None:
+    msg = f"网络异常，常驻监测已停止。\n错误：{type(exc).__name__}: {exc}"
+    if snapshot is not None:
+        msg += f"\n已导出快照：{snapshot}"
+    logger.error(msg)
+    if notifier is not None:
+        try:
+            await notifier.send_text(msg)
+        except Exception:
+            pass
+    raise SystemExit(2)
 
 
 async def _backtest(
@@ -1029,6 +1226,12 @@ def main() -> None:
         help="扫描达标信号时写入虚拟盘账本；通常与 --scan-market 一起使用",
     )
     parser.add_argument(
+        "--symbol-cooldown-minutes",
+        type=int,
+        default=60,
+        help="同一币种同方向冷却时间（开/平仓后不再重复记录同方向），默认60分钟；设为0关闭",
+    )
+    parser.add_argument(
         "--paper-sync",
         action="store_true",
         help="用最新行情更新虚拟盘账本里的待触发和持仓记录",
@@ -1042,6 +1245,38 @@ def main() -> None:
         "--paper-path",
         default="paper_trades.json",
         help="虚拟盘账本文件路径，默认 paper_trades.json",
+    )
+    parser.add_argument(
+        "--paper-entry-mode",
+        default="immediate",
+        help="虚拟盘入场模式：immediate(信号即按当前价入场) 或 confirm(等待站稳触发价)，默认 immediate",
+    )
+    parser.add_argument(
+        "--paper-export",
+        default="paper_trades.csv",
+        help="虚拟盘导出文件路径（.csv 或 .xlsx），默认 paper_trades.csv",
+    )
+    parser.add_argument(
+        "--paper-export-every-hours",
+        type=int,
+        default=24,
+        help="常驻运行时每隔N小时导出一次（0表示每轮循环都导出），默认24",
+    )
+    parser.add_argument(
+        "--paper-snapshot-dir",
+        default="paper_snapshots",
+        help="最终快照CSV输出目录（断网/异常/手动停止时落盘），默认 paper_snapshots",
+    )
+    parser.add_argument(
+        "--run-live",
+        action="store_true",
+        help="常驻运行：循环扫描市场、同步虚拟盘、导出表格（Ctrl+C 停止）",
+    )
+    parser.add_argument(
+        "--loop-minutes",
+        type=int,
+        default=5,
+        help="常驻运行循环间隔分钟数，默认5",
     )
     args = parser.parse_args()
 
@@ -1129,6 +1364,8 @@ def main() -> None:
                 paper_record=args.paper_record,
                 paper_path=args.paper_path,
                 confirm_minutes=args.confirm_minutes,
+                paper_entry_mode=args.paper_entry_mode,
+                symbol_cooldown_minutes=args.symbol_cooldown_minutes,
                 notifier=notifier if args.notify else None,
             )
         )
@@ -1219,6 +1456,11 @@ def main() -> None:
         report_lines.extend(["", paper_summary_zh(result.trades)])
         report = "\n".join(report_lines)
         logger.info("\n%s", report)
+        try:
+            exported = export_paper_trades(args.paper_export, result.trades)
+            logger.info("虚拟盘已导出：%s", exported)
+        except Exception as exc:
+            logger.warning("虚拟盘导出失败：%s", exc)
         if args.notify:
             asyncio.run(notifier.send_text(report))
 
@@ -1228,6 +1470,68 @@ def main() -> None:
         if args.notify:
             asyncio.run(notifier.send_text(report))
 
+    if args.run_live:
+        if args.loop_minutes < 1:
+            raise ValueError("--loop-minutes 必须大于 0")
+        try:
+            asyncio.run(
+                _run_live_loop(
+                    fixed_symbols=_parse_csv(args.fixed_symbols),
+                    top_volume_limit=args.top_volume_limit,
+                    score_threshold=args.score_threshold,
+                    expected_hold_hours=args.hold_hours,
+                    min_hold_hours=args.min_hold_hours,
+                    max_hold_hours=args.max_hold_hours,
+                    dynamic_hold=not args.fixed_hold,
+                    target_rr=args.target_rr,
+                    expire_minutes=args.expire_minutes,
+                    symbol_thresholds=symbol_thresholds,
+                    direction_thresholds=direction_thresholds,
+                    dynamic_alt_limit=args.dynamic_alt_limit,
+                    dynamic_alt_top_limit=args.dynamic_alt_top_limit,
+                    dynamic_alt_lookback_days=args.dynamic_alt_lookback_days,
+                    dynamic_alt_volume_ratio=args.dynamic_alt_volume_ratio,
+                    dynamic_alt_min_quote_volume=args.dynamic_alt_min_quote_volume,
+                    dynamic_alt_min_daily_move_pct=args.dynamic_alt_min_daily_move_pct,
+                    dynamic_alt_max_daily_move_pct=args.dynamic_alt_max_daily_move_pct,
+                    dynamic_alt_min_daily_range_pct=args.dynamic_alt_min_daily_range_pct,
+                    dynamic_alt_max_daily_range_pct=args.dynamic_alt_max_daily_range_pct,
+                    dynamic_alt_threshold=args.dynamic_alt_threshold,
+                    dynamic_alt_long_only=not args.dynamic_alt_allow_short,
+                    conflict_threshold=args.conflict_threshold,
+                    relative_rank_limit=args.relative_rank_limit,
+                    weekly_filter=not args.no_weekly_filter,
+                    paper_path=args.paper_path,
+                    paper_entry_mode=args.paper_entry_mode,
+                    confirm_minutes=args.confirm_minutes,
+                    paper_export_path=args.paper_export,
+                    paper_export_every_hours=args.paper_export_every_hours,
+                    paper_snapshot_dir=args.paper_snapshot_dir,
+                    loop_minutes=args.loop_minutes,
+                    symbol_cooldown_minutes=args.symbol_cooldown_minutes,
+                    fee_rate=args.fee_rate,
+                    funding_rate_8h=args.funding_rate_8h,
+                    time_stop_minutes=args.time_stop_minutes,
+                    min_progress_r=args.min_progress_r,
+                    r_trailing_enabled=not args.no_r_trailing,
+                    trailing_trigger_pct=args.trailing_trigger_pct,
+                    trailing_lock_pct=args.trailing_lock_pct,
+                    notifier=notifier if args.notify else None,
+                )
+            )
+        except KeyboardInterrupt:
+            try:
+                now_utc = datetime.now(UTC)
+                snap_dir = Path(args.paper_snapshot_dir)
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                exported = export_paper_trades(
+                    snap_dir / Path(_timestamped_export_path(Path(args.paper_export).name, now_utc, "stopped")),
+                    load_paper_trades(args.paper_path),
+                )
+                logger.info("已停止运行；虚拟盘最终快照已导出：%s", exported)
+            except Exception as exc:
+                logger.warning("停止时导出最终快照失败：%s", exc)
+
     if (
         not args.telegram_ping
         and not args.market_test
@@ -1235,6 +1539,7 @@ def main() -> None:
         and not args.backtest
         and not args.paper_sync
         and not args.paper_summary
+        and not args.run_live
     ):
         logger.info("Telegram 通知器已就绪（可使用 --telegram-ping 测试）")
 

@@ -59,6 +59,8 @@ class PaperTrade:
     pnl_pct: float = 0.0
     funding_cost_pct: float = 0.0
     last_checked_ms: int = 0
+    last_price: float = 0.0
+    unrealized_pnl_pct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ def record_signal_candidates(
     *,
     signal_time_ms: int | None = None,
     confirm_minutes: int = 10,
+    entry_mode: str = "confirm",
+    cooldown_minutes: int = 60,
     dedupe_minutes: int = 60,
 ) -> list[PaperTrade]:
     signal_at = signal_time_ms if signal_time_ms is not None else now_ms()
@@ -111,12 +115,15 @@ def record_signal_candidates(
     for candidate in candidates:
         if candidate.direction not in {"做多观察", "做空观察"}:
             continue
+        if _is_in_cooldown(trades, candidate, signal_at, cooldown_minutes):
+            continue
         if _has_duplicate_active_trade(trades, candidate, signal_at, dedupe_minutes):
             continue
         trade = _paper_trade_from_candidate(
             candidate,
             signal_time_ms=signal_at,
             confirm_minutes=confirm_minutes,
+            entry_mode=entry_mode,
         )
         trades.append(trade)
         recorded.append(trade)
@@ -131,6 +138,8 @@ def record_signal_candidate(
     *,
     signal_time_ms: int | None = None,
     confirm_minutes: int = 10,
+    entry_mode: str = "confirm",
+    cooldown_minutes: int = 60,
     dedupe_minutes: int = 60,
 ) -> PaperTrade | None:
     recorded = record_signal_candidates(
@@ -138,6 +147,8 @@ def record_signal_candidate(
         path,
         signal_time_ms=signal_time_ms,
         confirm_minutes=confirm_minutes,
+        entry_mode=entry_mode,
+        cooldown_minutes=cooldown_minutes,
         dedupe_minutes=dedupe_minutes,
     )
     return recorded[0] if recorded else None
@@ -173,7 +184,7 @@ def update_paper_trade_with_candles(
             trailing_trigger_pct=trailing_trigger_pct,
             trailing_lock_pct=trailing_lock_pct,
         )
-    return _advance_open_trade(
+    updated = _advance_open_trade(
         trade,
         ordered,
         now_time_ms=now_time_ms,
@@ -185,6 +196,7 @@ def update_paper_trade_with_candles(
         trailing_trigger_pct=trailing_trigger_pct,
         trailing_lock_pct=trailing_lock_pct,
     )
+    return _mark_to_market(updated, ordered)
 
 
 async def sync_paper_trades(
@@ -287,6 +299,150 @@ def paper_summary_zh(trades: Sequence[PaperTrade]) -> str:
     return "\n".join(lines)
 
 
+def export_paper_trades(path: str | Path, trades: Sequence[PaperTrade]) -> Path:
+    out = Path(path)
+    if out.suffix.lower() == ".xlsx":
+        try:
+            return _export_paper_trades_xlsx(out, trades)
+        except ModuleNotFoundError:
+            csv_path = out.with_suffix(".csv")
+            return _export_paper_trades_csv(csv_path, trades)
+    return _export_paper_trades_csv(out, trades)
+
+
+def _export_paper_trades_csv(path: Path, trades: Sequence[PaperTrade]) -> Path:
+    import csv
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = [
+        "paper_id",
+        "symbol",
+        "direction",
+        "status",
+        "score",
+        "level",
+        "signal_time",
+        "signal_price",
+        "entry_time",
+        "entry_price",
+        "last_price",
+        "unrealized_pnl_pct",
+        "stop_loss",
+        "tp1_price",
+        "final_target_price",
+        "active_stop_price",
+        "tp1_hit",
+        "trailing_stop_activated",
+        "trailing_stop_price",
+        "outcome",
+        "exit_time",
+        "exit_price",
+        "pnl_pct",
+        "funding_cost_pct",
+    ]
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for t in trades:
+            w.writerow(
+                {
+                    "paper_id": t.paper_id,
+                    "symbol": t.symbol,
+                    "direction": t.direction,
+                    "status": t.status,
+                    "score": t.score,
+                    "level": t.level,
+                    "signal_time": _format_ms(t.signal_time_ms),
+                    "signal_price": t.signal_price,
+                    "entry_time": _format_ms(t.entry_time_ms),
+                    "entry_price": t.entry_price,
+                    "last_price": t.last_price,
+                    "unrealized_pnl_pct": round(t.unrealized_pnl_pct * 100, 6),
+                    "stop_loss": t.stop_loss,
+                    "tp1_price": t.tp1_price,
+                    "final_target_price": t.final_target_price,
+                    "active_stop_price": t.active_stop_price,
+                    "tp1_hit": t.tp1_hit,
+                    "trailing_stop_activated": t.trailing_stop_activated,
+                    "trailing_stop_price": t.trailing_stop_price,
+                    "outcome": t.outcome,
+                    "exit_time": _format_ms(t.exit_time_ms),
+                    "exit_price": t.exit_price,
+                    "pnl_pct": round(t.pnl_pct * 100, 6),
+                    "funding_cost_pct": round(t.funding_cost_pct * 100, 6),
+                }
+            )
+    return path
+
+
+def _export_paper_trades_xlsx(path: Path, trades: Sequence[PaperTrade]) -> Path:
+    from openpyxl import Workbook
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "paper_trades"
+
+    headers = [
+        "paper_id",
+        "symbol",
+        "direction",
+        "status",
+        "score",
+        "level",
+        "signal_time",
+        "signal_price",
+        "entry_time",
+        "entry_price",
+        "last_price",
+        "unrealized_pnl_pct(%)",
+        "stop_loss",
+        "tp1_price",
+        "final_target_price",
+        "active_stop_price",
+        "tp1_hit",
+        "trailing_stop_activated",
+        "trailing_stop_price",
+        "outcome",
+        "exit_time",
+        "exit_price",
+        "pnl_pct(%)",
+        "funding_cost_pct(%)",
+    ]
+    ws.append(headers)
+    for t in trades:
+        ws.append(
+            [
+                t.paper_id,
+                t.symbol,
+                t.direction,
+                t.status,
+                t.score,
+                t.level,
+                _format_ms(t.signal_time_ms),
+                t.signal_price,
+                _format_ms(t.entry_time_ms),
+                t.entry_price,
+                t.last_price,
+                round(t.unrealized_pnl_pct * 100, 6),
+                t.stop_loss,
+                t.tp1_price,
+                t.final_target_price,
+                t.active_stop_price,
+                int(t.tp1_hit),
+                int(t.trailing_stop_activated),
+                t.trailing_stop_price,
+                t.outcome,
+                _format_ms(t.exit_time_ms),
+                t.exit_price,
+                round(t.pnl_pct * 100, 6),
+                round(t.funding_cost_pct * 100, 6),
+            ]
+        )
+    wb.save(path)
+    return path
+
+
 def _paper_trade_from_dict(item: Any) -> PaperTrade:
     if not isinstance(item, dict):
         raise ValueError("虚拟盘账本存在非法记录")
@@ -302,10 +458,11 @@ def _paper_trade_from_candidate(
     *,
     signal_time_ms: int,
     confirm_minutes: int,
+    entry_mode: str,
 ) -> PaperTrade:
     confirm_until_ms = signal_time_ms + max(1, confirm_minutes) * MINUTE_MS
     expires_at_ms = signal_time_ms + max(1, candidate.expires_after_minutes) * MINUTE_MS
-    return PaperTrade(
+    base = PaperTrade(
         paper_id=_candidate_id(candidate, signal_time_ms),
         symbol=candidate.symbol.strip().upper(),
         direction=candidate.direction,
@@ -326,6 +483,25 @@ def _paper_trade_from_candidate(
         active_stop_price=candidate.stop_loss,
         last_checked_ms=signal_time_ms,
     )
+    mode = (entry_mode or "confirm").strip().lower()
+    if mode in {"immediate", "now", "market"}:
+        entry = candidate.current_price
+        is_long = candidate.direction == "做多观察"
+        risk = max(abs(entry - candidate.stop_loss), entry * 0.001)
+        tp1 = candidate.take_profit_1 if candidate.take_profit_1 else (entry + risk if is_long else entry - risk)
+        tp2 = candidate.take_profit_2 if candidate.take_profit_2 else (
+            entry + candidate.target_rr * risk if is_long else entry - candidate.target_rr * risk
+        )
+        return replace(
+            base,
+            status=OPEN,
+            entry_time_ms=signal_time_ms,
+            entry_price=entry,
+            tp1_price=tp1,
+            final_target_price=tp2,
+            active_stop_price=candidate.stop_loss,
+        )
+    return base
 
 
 def _candidate_id(candidate: ObservationCandidate, signal_time_ms: int) -> str:
@@ -358,6 +534,27 @@ def _has_duplicate_active_trade(
         if trigger_gap <= 0.001 and stop_gap <= 0.001 and abs(signal_time_ms - trade.signal_time_ms) <= max_gap_ms:
             return True
     return False
+
+
+def _is_in_cooldown(
+    trades: Sequence[PaperTrade],
+    candidate: ObservationCandidate,
+    signal_time_ms: int,
+    cooldown_minutes: int,
+) -> bool:
+    if cooldown_minutes <= 0:
+        return False
+    cooldown_ms = cooldown_minutes * MINUTE_MS
+    symbol = candidate.symbol.strip().upper()
+    direction = candidate.direction
+    last_event = -1
+    for trade in trades:
+        if trade.symbol != symbol or trade.direction != direction:
+            continue
+        event_time = trade.exit_time_ms or trade.entry_time_ms or trade.signal_time_ms
+        if event_time is not None:
+            last_event = max(last_event, int(event_time))
+    return last_event >= 0 and (signal_time_ms - last_event) < cooldown_ms
 
 
 def _fetch_start_ms(trade: PaperTrade) -> int:
@@ -441,6 +638,8 @@ def _open_trade_from_candle(trade: PaperTrade, candle: Candle) -> PaperTrade:
         final_target_price=final_target,
         active_stop_price=trade.stop_loss,
         last_checked_ms=candle.close_time,
+        last_price=entry,
+        unrealized_pnl_pct=0.0,
     )
 
 
@@ -694,7 +893,7 @@ def _advance_open_trade(
             )
         last_checked = candle.close_time
 
-    return replace(
+    out = replace(
         trade,
         tp1_price=tp1,
         final_target_price=tp2,
@@ -706,6 +905,19 @@ def _advance_open_trade(
         best_progress_r=best_progress_r,
         last_checked_ms=last_checked,
     )
+    return _mark_to_market(out, candles)
+
+
+def _mark_to_market(trade: PaperTrade, candles: Sequence[Candle]) -> PaperTrade:
+    if not candles:
+        return trade
+    last = candles[-1].close
+    if trade.status != OPEN or trade.entry_price <= 0:
+        return replace(trade, last_price=last, unrealized_pnl_pct=0.0)
+    gross = (last - trade.entry_price) / trade.entry_price
+    if trade.direction == "做空观察":
+        gross = (trade.entry_price - last) / trade.entry_price
+    return replace(trade, last_price=last, unrealized_pnl_pct=gross)
 
 
 def _close_trade(

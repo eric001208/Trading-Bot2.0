@@ -221,6 +221,10 @@ async def fetch_usdm_24h_tickers(
     url = f"{base_url.rstrip('/')}/fapi/v1/ticker/24hr"
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url)
+        # Some regions return HTTP 451 for this endpoint. For backtests and scanners
+        # we can safely degrade to an empty list (dynamic pools will be skipped).
+        if r.status_code == 451 and base_url.rstrip("/") == DEFAULT_FAPI_BASE_URL:
+            return []
         r.raise_for_status()
         raw = r.json()
 

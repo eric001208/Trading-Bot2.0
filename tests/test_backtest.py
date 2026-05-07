@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from crypto_signal_bot.backtest import BacktestSummary, BacktestTrade, _simulate_exit
+from crypto_signal_bot.backtest import BacktestSummary, BacktestTrade, _simulate_exit, export_backtest_trades_csv
 from crypto_signal_bot.models import Candle
 
 
@@ -30,6 +30,23 @@ def test_backtest_summary_metrics() -> None:
     assert round(summary.profit_factor, 2) == 2.5
     assert "BTCUSDT 回测结果" in summary.report_zh()
 
+
+def test_export_backtest_trades_csv_adds_human_time_columns(tmp_path) -> None:
+    summary = BacktestSummary(
+        symbol="BTCUSDT",
+        days=7,
+        score_threshold=70,
+        hold_hours=2.0,
+        target_rr=2.0,
+        trades=(
+            BacktestTrade("BTCUSDT", "做多观察", 90, 1_000, 2_000, 100.0, 101.0, 99.0, 102.0, "到期平仓", 0.01),
+        ),
+    )
+    out = export_backtest_trades_csv([summary], tmp_path / "trades.csv")
+    text = out.read_text(encoding="utf-8-sig")
+    assert "入场时间(UTC)" in text
+    assert "出场时间(UTC)" in text
+    assert "收益率(%)" in text
 
 def test_partial_take_profit_moves_remaining_to_breakeven() -> None:
     entry = Candle(1, 100.0, 100.0, 100.0, 100.0, 1.0, 2, True)
