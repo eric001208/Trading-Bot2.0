@@ -921,6 +921,7 @@ async def _run_live_loop(
     export_every = max(0, int(paper_export_every_hours))
     next_export_at = datetime.now(UTC) + timedelta(hours=export_every) if export_every else None
     loop_no = 0
+    consecutive_network_errors = 0
     while True:
         loop_no += 1
         logger.info("常驻运行第 %s 轮开始（UTC=%s）", loop_no, datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"))
@@ -968,7 +969,13 @@ async def _run_live_loop(
             logger.exception("常驻运行扫描失败：%s", exc)
             snap = _export_snapshot_on_issue(snapshot_dir, paper_export_path, paper_path, reason="scan_error")
             if _is_network_error(exc):
-                await _notify_and_stop_on_network_error(notifier, exc, snap)
+                consecutive_network_errors += 1
+                if consecutive_network_errors >= 2:
+                    await _notify_and_stop_on_network_error(notifier, exc, snap)
+                await _maybe_notify_network_error(notifier, exc, snap, consecutive_network_errors, loop_minutes)
+                logger.info("网络异常，本轮扫描暂停，等待 %s 分钟后重试。", loop_minutes)
+                await asyncio.sleep(loop_minutes * 60)
+                continue
 
         try:
             before_trades = load_paper_trades(paper_path)
@@ -982,6 +989,7 @@ async def _run_live_loop(
                 trailing_trigger_pct=trailing_trigger_pct,
                 trailing_lock_pct=trailing_lock_pct,
             )
+            consecutive_network_errors = 0
             if notifier is not None and result.changed_count:
                 for msg in _paper_event_messages(before_trades, result.trades):
                     await notifier.send_text(msg)
@@ -1000,7 +1008,13 @@ async def _run_live_loop(
             logger.exception("常驻运行虚拟盘同步/导出失败：%s", exc)
             snap = _export_snapshot_on_issue(snapshot_dir, paper_export_path, paper_path, reason="sync_error")
             if _is_network_error(exc):
-                await _notify_and_stop_on_network_error(notifier, exc, snap)
+                consecutive_network_errors += 1
+                if consecutive_network_errors >= 2:
+                    await _notify_and_stop_on_network_error(notifier, exc, snap)
+                await _maybe_notify_network_error(notifier, exc, snap, consecutive_network_errors, loop_minutes)
+                logger.info("网络异常，本轮同步暂停，等待 %s 分钟后重试。", loop_minutes)
+                await asyncio.sleep(loop_minutes * 60)
+                continue
 
         next_run = datetime.now(UTC) + timedelta(minutes=loop_minutes)
         logger.info("本轮结束，等待 %s 分钟后继续（预计UTC=%s）", loop_minutes, next_run.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1058,6 +1072,26 @@ async def _notify_and_stop_on_network_error(
         except Exception:
             pass
     raise SystemExit(2)
+
+
+async def _maybe_notify_network_error(
+    notifier: TelegramNotifier | None,
+    exc: Exception,
+    snapshot: Path | None,
+    consecutive_count: int,
+    loop_minutes: int,
+) -> None:
+    # 仅在第一次网络异常时提示“将重试”，避免刷屏。
+    if notifier is None or consecutive_count != 1:
+        return
+    msg = f"网络异常，本轮已暂停，将在下一轮重试（约 {loop_minutes} 分钟后）。\n错误：{type(exc).__name__}: {exc}"
+    if snapshot is not None:
+        msg += f"\n已导出快照：{snapshot}"
+    msg += "\n提示：如果连续两轮仍出现网络异常，程序将自动停止。"
+    try:
+        await notifier.send_text(msg)
+    except Exception:
+        pass
 
 
 async def _backtest(
