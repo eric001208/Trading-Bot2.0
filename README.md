@@ -128,6 +128,22 @@ python main.py --backtest --backtest-days 7 --score-threshold 90 --hold-hours 2 
 
 交易明细 CSV 包含清晰表头与可读时间（包含 UTC 与本地时间两列）。
 
+### 5) 方向准确率评估（入场后 N 分钟方向对错）
+
+用于回答“方向对了但止盈止损不合理”的问题：对每一笔回测交易，取入场后 N 分钟的价格，判断方向是否正确，并统计胜率。
+
+```powershell
+python main.py --direction-eval `
+  --direction-trades-csv backtest_trades.csv `
+  --direction-horizon-minutes 60 `
+  --direction-min-move-pct 0
+```
+
+说明：
+
+- 价格取值：使用 Binance 5m K 线，找到 `close_time >= 入场时间 + N分钟` 的第一根K线收盘价作为评估点
+- 判定：做多在评估点涨则算对，做空在评估点跌则算对；`--direction-min-move-pct` 可把微小波动视为平局
+
 ## 输出文件说明（默认）
 
 这些文件是运行时生成的，仓库已通过 `.gitignore` 忽略它们：

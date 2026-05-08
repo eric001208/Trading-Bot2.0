@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import logging
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1057,6 +1059,166 @@ def _is_network_error(exc: Exception) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class DirectionAccuracy:
+    total: int
+    wins: int
+    ties: int
+    avg_move_pct: float
+
+    @property
+    def win_rate(self) -> float:
+        return self.wins / self.total if self.total else 0.0
+
+
+async def _direction_accuracy_1h(
+    *,
+    trades_csv: str,
+    horizon_minutes: int,
+    min_move_pct: float,
+) -> None:
+    """
+    Evaluate directional correctness after a fixed horizon.
+
+    Definition:
+    - Take each executed trade from exported backtest CSV.
+    - Find the first 5m candle whose close_time >= entry_time + horizon.
+    - LONG is "correct" if price_change_pct > +min_move_pct.
+    - SHORT is "correct" if price_change_pct < -min_move_pct.
+    - Otherwise counted as tie/incorrect depending on sign; we track ties explicitly.
+    """
+    path = Path(trades_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到交易明细CSV：{trades_csv}")
+    if horizon_minutes <= 0:
+        raise ValueError("--direction-horizon-minutes 必须大于 0")
+    if min_move_pct < 0:
+        raise ValueError("--direction-min-move-pct 不能小于 0")
+
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = [r for r in reader if r]
+    if not rows:
+        raise ValueError(f"CSV 没有任何记录：{trades_csv}")
+
+    # Parse trades and compute fetch range.
+    horizon_ms = horizon_minutes * 60_000
+    min_entry_ms = 2**63 - 1
+    max_eval_ms = 0
+    trades: list[tuple[str, str, int, float]] = []
+    for r in rows:
+        symbol = (r.get("交易对") or "").strip().upper()
+        direction = (r.get("方向") or "").strip()
+        entry_utc_text = (r.get("入场时间(UTC)") or "").strip()
+        entry_price_text = (r.get("入场价") or "").strip()
+        if not symbol or not direction or not entry_utc_text or not entry_price_text:
+            continue
+        dt = datetime.fromisoformat(entry_utc_text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        entry_ms = int(dt.timestamp() * 1000)
+        try:
+            entry_price = float(entry_price_text)
+        except ValueError:
+            continue
+        min_entry_ms = min(min_entry_ms, entry_ms)
+        max_eval_ms = max(max_eval_ms, entry_ms + horizon_ms)
+        trades.append((symbol, direction, entry_ms, entry_price))
+    if not trades:
+        raise ValueError("CSV 中没有可解析的交易记录。")
+
+    # Load 5m klines once per symbol.
+    by_symbol: dict[str, list[tuple[str, int, float]]] = defaultdict(list)
+    for symbol, direction, entry_ms, entry_price in trades:
+        by_symbol[symbol].append((direction, entry_ms, entry_price))
+
+    logger.info(
+        "开始方向准确率评估：交易数=%s，周期=%s分钟，最小方向阈值=%.4f%%，交易对=%s",
+        len(trades),
+        horizon_minutes,
+        min_move_pct,
+        "，".join(sorted(by_symbol)),
+    )
+
+    candles_by_symbol: dict[str, tuple[list[int], list[float]]] = {}
+    # Provide a small pad to avoid missing the last eval point.
+    start_ms = max(0, min_entry_ms - 6 * 60_000)
+    end_ms = max_eval_ms + 6 * 60_000
+    for symbol in sorted(by_symbol):
+        klines = await fetch_usdm_klines_range(
+            symbol=symbol,
+            interval="5m",
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+        )
+        candles = [Candle.from_kline(k) for k in klines]
+        close_times = [c.close_time for c in candles]
+        closes_ = [c.close for c in candles]
+        candles_by_symbol[symbol] = (close_times, closes_)
+        logger.info("%s 5m K线载入完成：%s 根", symbol, len(candles))
+
+    def evaluate(group: list[tuple[str, int, float]], series: tuple[list[int], list[float]]) -> DirectionAccuracy:
+        close_times, closes_ = series
+        total = 0
+        wins = 0
+        ties = 0
+        sum_move = 0.0
+        for direction, entry_ms, entry_price in group:
+            eval_ms = entry_ms + horizon_ms
+            idx = bisect_left(close_times, eval_ms)
+            if idx >= len(closes_) or entry_price <= 0:
+                continue
+            price = closes_[idx]
+            move = (price - entry_price) / entry_price
+            total += 1
+            # move in the "favorable" direction for averaging.
+            favorable_move = move if direction == "做多观察" else -move
+            sum_move += favorable_move * 100
+
+            threshold = min_move_pct / 100.0
+            if abs(move) <= threshold:
+                ties += 1
+                continue
+            if direction == "做多观察":
+                if move > threshold:
+                    wins += 1
+            elif direction == "做空观察":
+                if move < -threshold:
+                    wins += 1
+        avg_move = (sum_move / total) if total else 0.0
+        return DirectionAccuracy(total=total, wins=wins, ties=ties, avg_move_pct=avg_move)
+
+    overall_total = 0
+    overall_wins = 0
+    overall_ties = 0
+    overall_move_sum = 0.0
+
+    print("")
+    print(f"方向准确率评估（{horizon_minutes}分钟）")
+    print(f"判定阈值：|涨跌幅| <= {min_move_pct:.4f}% 视为平局")
+    print(f"数据来源：{trades_csv}")
+    print("")
+    for symbol in sorted(by_symbol):
+        acc = evaluate(by_symbol[symbol], candles_by_symbol[symbol])
+        overall_total += acc.total
+        overall_wins += acc.wins
+        overall_ties += acc.ties
+        overall_move_sum += acc.avg_move_pct * acc.total
+        print(
+            f"{symbol}：胜率 {acc.win_rate * 100:.2f}%（{acc.wins}/{acc.total}），"
+            f"平局 {acc.ties}，平均有利波动 {acc.avg_move_pct:+.3f}%"
+        )
+
+    overall_avg_move = (overall_move_sum / overall_total) if overall_total else 0.0
+    overall_win_rate = (overall_wins / overall_total) if overall_total else 0.0
+    print("")
+    print(
+        f"总体：胜率 {overall_win_rate * 100:.2f}%（{overall_wins}/{overall_total}），"
+        f"平局 {overall_ties}，平均有利波动 {overall_avg_move:+.3f}%"
+    )
+
+
 async def _notify_and_stop_on_network_error(
     notifier: TelegramNotifier | None,
     exc: Exception,
@@ -1221,6 +1383,11 @@ def main() -> None:
         "--backtest",
         action="store_true",
         help="使用 Binance 历史合约K线回测观察型策略",
+    )
+    parser.add_argument(
+        "--direction-eval",
+        action="store_true",
+        help="基于回测交易明细CSV评估方向准确率（默认1小时）",
     )
     parser.add_argument(
         "--symbols",
@@ -1454,6 +1621,23 @@ def main() -> None:
         help="导出回测交易明细CSV，可选指定文件名",
     )
     parser.add_argument(
+        "--direction-trades-csv",
+        default="backtest_trades_2025_to_now_btc_eth.csv",
+        help="方向准确率评估用的回测交易明细CSV路径",
+    )
+    parser.add_argument(
+        "--direction-horizon-minutes",
+        type=int,
+        default=60,
+        help="方向准确率评估：入场后 N 分钟做方向判定，默认60",
+    )
+    parser.add_argument(
+        "--direction-min-move-pct",
+        type=float,
+        default=0.0,
+        help="方向准确率评估：|涨跌幅|<=该值(百分比) 视为平局，默认0",
+    )
+    parser.add_argument(
         "--notify",
         action="store_true",
         help="把测试或扫描结果发送到 Telegram",
@@ -1678,6 +1862,16 @@ def main() -> None:
         )
         logger.info("观察型策略回测完成")
 
+    if args.direction_eval:
+        asyncio.run(
+            _direction_accuracy_1h(
+                trades_csv=args.direction_trades_csv,
+                horizon_minutes=args.direction_horizon_minutes,
+                min_move_pct=args.direction_min_move_pct,
+            )
+        )
+        logger.info("方向准确率评估完成")
+
     if args.paper_sync:
         if args.fee_rate < 0 or args.funding_rate_8h < 0:
             raise ValueError("--fee-rate 与 --funding-rate-8h 不能小于 0")
@@ -1782,6 +1976,7 @@ def main() -> None:
         and not args.market_test
         and not args.scan_market
         and not args.backtest
+        and not args.direction_eval
         and not args.paper_sync
         and not args.paper_summary
         and not args.run_live
