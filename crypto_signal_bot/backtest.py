@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,8 @@ from crypto_signal_bot.strategies import ObservationCandidate, evaluate_observat
 ENTRY_INTERVAL_MS = 15 * 60_000
 TREND_INTERVAL_MS = 60 * 60_000
 FUNDING_INTERVAL_MS = 8 * 60 * 60_000
+DEFAULT_TREND_WINDOW_BARS = 360  # match live scanner (about 15 days of 1h bars)
+DEFAULT_ENTRY_WINDOW_BARS = 180  # match live scanner (about 45 hours of 15m bars)
 
 
 @dataclass(frozen=True)
@@ -663,36 +666,71 @@ def run_observation_backtest_from_candles(
     cooldown_bars: int | None = None,
     days: int = 0,
     start_index: int = 120,
+    trend_window_bars: int = DEFAULT_TREND_WINDOW_BARS,
+    entry_window_bars: int = DEFAULT_ENTRY_WINDOW_BARS,
 ) -> BacktestSummary:
     max_configured_hold_hours = max_hold_hours if dynamic_hold else hold_hours
     max_hold_bars = max(1, int(round(max_configured_hold_hours * 60 / 15)))
     cooldown = max_hold_bars if cooldown_bars is None else max(0, cooldown_bars)
     trades: list[BacktestTrade] = []
+    entry = list(entry_candles)
+    trend = list(trend_candles)
+    market_trend = list(market_trend_candles) if market_trend_candles is not None else None
+    market_entry = list(market_entry_candles) if market_entry_candles is not None else None
+
+    # Precompute keys for fast bisection. This keeps long backtests (e.g. 2025->now) practical.
+    trend_close_times = [c.close_time for c in trend]
+    market_trend_close_times = [c.close_time for c in market_trend] if market_trend is not None else None
+    market_entry_close_times = [c.close_time for c in market_entry] if market_entry is not None else None
+
     i = max(120, start_index)
-    last_entry_index = len(entry_candles) - max_hold_bars - 1
-    lower_timeframe = list(confirmation_candles or entry_candles)
+    last_entry_index = len(entry) - max_hold_bars - 1
+    lower_timeframe = list(confirmation_candles or entry)
+    lower_close_times = [c.close_time for c in lower_timeframe]
+
+    def _between(start_after_ms: int, end_at_ms: int) -> list[Candle]:
+        if end_at_ms <= start_after_ms:
+            return []
+        start_idx = bisect_right(lower_close_times, start_after_ms)
+        end_idx = bisect_right(lower_close_times, end_at_ms)
+        return lower_timeframe[start_idx:end_idx]
 
     while i <= last_entry_index:
         if allowed_entry_days is not None:
-            entry_day = datetime.fromtimestamp(entry_candles[i].close_time / 1000, UTC).date().isoformat()
+            entry_day = datetime.fromtimestamp(entry[i].close_time / 1000, UTC).date().isoformat()
             if entry_day not in allowed_entry_days:
                 i += 1
                 continue
-        entry_slice = list(entry_candles[: i + 1])
-        trend_slice = _trend_slice_for_time(trend_candles, entry_candles[i].close_time)
-        market_slice = (
-            _trend_slice_for_time(market_trend_candles, entry_candles[i].close_time)
-            if market_trend_candles is not None
-            else None
-        )
-        market_entry_slice = (
-            _entry_slice_for_time(market_entry_candles, entry_candles[i].close_time)
-            if market_entry_candles is not None
-            else None
-        )
+
+        close_time_ms = entry[i].close_time
+
+        # Windowed slices: use the same horizon as the live scanner (constant memory/time per step).
+        entry_start = max(0, i - max(1, int(entry_window_bars)) + 1)
+        entry_slice = entry[entry_start : i + 1]
+
+        trend_end = bisect_right(trend_close_times, close_time_ms) - 1
+        if trend_end < 0:
+            i += 1
+            continue
+        trend_start = max(0, trend_end - max(1, int(trend_window_bars)) + 1)
+        trend_slice = trend[trend_start : trend_end + 1]
         if len(trend_slice) < 120:
             i += 1
             continue
+
+        market_slice = None
+        if market_trend is not None and market_trend_close_times is not None:
+            market_end = bisect_right(market_trend_close_times, close_time_ms) - 1
+            if market_end >= 0:
+                market_start = max(0, market_end - max(1, int(trend_window_bars)) + 1)
+                market_slice = market_trend[market_start : market_end + 1]
+
+        market_entry_slice = None
+        if market_entry is not None and market_entry_close_times is not None:
+            market_entry_end = bisect_right(market_entry_close_times, close_time_ms) - 1
+            if market_entry_end >= 0:
+                market_entry_start = max(0, market_entry_end - max(1, int(entry_window_bars)) + 1)
+                market_entry_slice = market_entry[market_entry_start : market_entry_end + 1]
 
         candidate = evaluate_observation_candidate(
             symbol=symbol,
@@ -716,11 +754,11 @@ def run_observation_backtest_from_candles(
             i += 1
             continue
 
-        candidate_close_time = entry_candles[i].close_time
+        candidate_close_time = close_time_ms
         if _has_conflicting_market_signal(
             candidate=candidate,
-            market_trend_candles=market_trend_candles,
-            market_entry_candles=market_entry_candles,
+            market_trend_candles=market_slice,
+            market_entry_candles=market_entry_slice,
             candidate_close_time_ms=candidate_close_time,
             hold_hours=hold_hours,
             target_rr=target_rr,
@@ -731,11 +769,7 @@ def run_observation_backtest_from_candles(
             i += 1
             continue
 
-        pending = _candles_between(
-            lower_timeframe,
-            start_after_ms=candidate_close_time,
-            end_at_ms=candidate_close_time + expire_minutes * 60_000,
-        )
+        pending = _between(candidate_close_time, candidate_close_time + expire_minutes * 60_000)
         confirmed = _find_confirmation_entry(
             candidate=candidate,
             confirmation_candles=pending,
@@ -749,11 +783,7 @@ def run_observation_backtest_from_candles(
 
         planned_hold_hours = candidate.expected_hold_hours if dynamic_hold else hold_hours
         planned_hold_ms = int(planned_hold_hours * 60 * 60_000)
-        future = _candles_between(
-            lower_timeframe,
-            start_after_ms=confirmed.close_time,
-            end_at_ms=confirmed.close_time + planned_hold_ms,
-        )
+        future = _between(confirmed.close_time, confirmed.close_time + planned_hold_ms)
         if not future:
             break
 
