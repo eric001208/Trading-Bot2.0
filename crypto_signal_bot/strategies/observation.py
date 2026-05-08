@@ -13,7 +13,19 @@ SIDEWAYS_SCORE_PENALTY = 5
 MIN_POSITION_SPACE_R = 1.2
 GOOD_POSITION_SPACE_R = 2.0
 SHORT_TREND_EMA_LOOKBACK = 1
-MIN_VOLUME_SPIKE_RATIO = 1.2
+MIN_VOLUME_SPIKE_RATIO = 1.3
+
+# 15m bars: we use a longer range window to reduce false breakouts from very short consolidations.
+ENTRY_RANGE_LOOKBACK_BARS = 32  # ~8 hours on 15m
+ENTRY_STOP_LOOKBACK_BARS = 16  # ~4 hours on 15m
+
+# If long/short scores are too close, it usually means the market is choppy or flipping.
+# Filtering these "low-confidence" states improves directional accuracy.
+MIN_DIRECTION_SCORE_GAP = 6
+
+# Efficiency ratio (Kaufman): net change / sum(|delta|). Signed in [-1, 1].
+TREND_EFFICIENCY_LOOKBACK_BARS = 24  # 24x 1h bars ~= 1 day
+MIN_TREND_EFFICIENCY_ABS = 0.12
 
 
 @dataclass(frozen=True)
@@ -266,15 +278,19 @@ def _short_term_trend_ok(
     # EMA 斜率在拐点附近容易出现很小的负值，这里允许轻微回撤，只要结构仍然向上。
     eps20 = (e20 or 0.0) * 0.00012
     eps50 = (e50 or 0.0) * 0.00008
+    # EMA20 与 EMA50 经常在临界点附近来回贴合；给一点点容错，避免把“刚要走出来”的行情过滤掉。
+    align_eps = (e50 or 0.0) * 0.0006
     if direction == "做多观察":
-        ok = price > e20 and e20 >= e50 and s20 > -eps20 and s50 > -eps50
+        align_ok = (e20 + align_eps) >= e50
+        ok = price > e20 and align_ok and s20 > -eps20 and s50 > -eps50
         detail = (
             f"EMA20/50结构：price={price:g} close={last:g} EMA20={e20:.4g} EMA50={e50:.4g} "
             f"slope20={s20:.4g} slope50={s50:.4g}"
         )
         return ok, detail
     if direction == "做空观察":
-        ok = price < e20 and e20 <= e50 and s20 < eps20 and s50 < eps50
+        align_ok = (e20 - align_eps) <= e50
+        ok = price < e20 and align_ok and s20 < eps20 and s50 < eps50
         detail = (
             f"EMA20/50结构：price={price:g} close={last:g} EMA20={e20:.4g} EMA50={e50:.4g} "
             f"slope20={s20:.4g} slope50={s50:.4g}"
@@ -300,6 +316,25 @@ def _pct_change(candles: Sequence[Candle], lookback: int) -> float | None:
     if old <= 0:
         return None
     return (candles[-1].close - old) / old
+
+
+def _efficiency_ratio(candles: Sequence[Candle], lookback: int) -> float | None:
+    """
+    Kaufman Efficiency Ratio (signed):
+      ER = (price[t] - price[t-lookback]) / sum(|price[i] - price[i-1]|), i in (t-lookback+1..t)
+
+    Returns values in [-1, 1]. Magnitude measures trend efficiency; sign gives direction.
+    """
+    if lookback <= 0 or len(candles) <= lookback:
+        return None
+    start = candles[-lookback - 1].close
+    end = candles[-1].close
+    denom = 0.0
+    for i in range(len(candles) - lookback, len(candles)):
+        denom += abs(candles[i].close - candles[i - 1].close)
+    if denom <= 0:
+        return 0.0
+    return (end - start) / denom
 
 
 def _aggregate_candles(candles: Sequence[Candle], bars_per_candle: int) -> list[Candle]:
@@ -805,7 +840,72 @@ def _score_candidate_direction(
         trend_pts += 10
         reasons.append("1h 短中期方向和均线斜率一致。")
 
-    recent = entry_candles[-16:-1]
+    # Add short-term (6h) momentum and 1h trend strength to reduce noisy flips.
+    trend_rsi = _rsi(trend_candles, 14)
+    trend_adx = _adx(trend_candles, 14)
+    move_6h = _directional_pct_change(trend_candles, 6, direction)
+    if move_6h is not None:
+        if move_6h >= 0.003:
+            score += 8
+            momentum_pts += 8
+            reasons.append(f"1h 近6小时顺势动量较强（{move_6h * 100:.2f}%）。")
+        elif move_6h <= -0.001:
+            score -= 8
+            momentum_pts -= 8
+            reasons.append(f"1h 近6小时动量与方向相反（{move_6h * 100:.2f}%），本轮信号降噪扣分。")
+
+    if trend_rsi is not None:
+        if is_long and trend_rsi >= 52:
+            score += 4
+            trend_pts += 4
+            reasons.append(f"1h RSI={trend_rsi:.1f} 偏强，偏向顺势做多。")
+        elif (not is_long) and trend_rsi <= 48:
+            score += 4
+            trend_pts += 4
+            reasons.append(f"1h RSI={trend_rsi:.1f} 偏弱，偏向顺势做空。")
+        elif is_long and trend_rsi <= 46:
+            score -= 4
+            trend_pts -= 4
+            reasons.append(f"1h RSI={trend_rsi:.1f} 偏弱，做多延续性存疑，扣分。")
+        elif (not is_long) and trend_rsi >= 54:
+            score -= 4
+            trend_pts -= 4
+            reasons.append(f"1h RSI={trend_rsi:.1f} 偏强，做空延续性存疑，扣分。")
+
+    if trend_adx is not None:
+        if trend_adx >= 18:
+            score += 4
+            trend_pts += 4
+            reasons.append(f"1h ADX={trend_adx:.1f} 显示有趋势强度。")
+        elif trend_adx < 12:
+            score -= 4
+            trend_pts -= 4
+            reasons.append(f"1h ADX={trend_adx:.1f} 偏低，震荡概率高，扣分。")
+
+    eff = _efficiency_ratio(trend_candles, TREND_EFFICIENCY_LOOKBACK_BARS)
+    if eff is not None:
+        eff_abs = abs(eff)
+        if eff_abs < MIN_TREND_EFFICIENCY_ABS:
+            score -= 6
+            trend_pts -= 6
+            reasons.append(
+                f"1h 趋势效率偏低（ER={eff:+.3f}），偏震荡，容易出现多空来回，降噪扣6分。"
+            )
+        else:
+            if is_long and eff > 0:
+                score += 4
+                trend_pts += 4
+                reasons.append(f"1h 趋势效率支持做多（ER={eff:+.3f}）。")
+            elif (not is_long) and eff < 0:
+                score += 4
+                trend_pts += 4
+                reasons.append(f"1h 趋势效率支持做空（ER={eff:+.3f}）。")
+            else:
+                score -= 6
+                trend_pts -= 6
+                reasons.append(f"1h 趋势效率与方向相反（ER={eff:+.3f}），降噪扣6分。")
+
+    recent = entry_candles[-(ENTRY_RANGE_LOOKBACK_BARS + 1) : -1]
     recent_range_high = max(c.high for c in recent)
     recent_range_low = min(c.low for c in recent)
     range_pct = (recent_range_high - recent_range_low) / entry_last.close
@@ -820,7 +920,9 @@ def _score_candidate_direction(
         momentum_pts += 8
         reasons.append("15m ADX 显示有一定趋势强度，减少纯震荡假突破。")
     elif adx < 12:
-        reasons.append("15m ADX 偏低，市场偏震荡，候选质量降低。")
+        score -= 6
+        momentum_pts -= 6
+        reasons.append("15m ADX 偏低，市场偏震荡，候选质量降低（扣6分）。")
 
     if is_long:
         pulled_back = recent_range_low <= entry_ma25 * 1.004 or recent_range_low <= entry_ma99 * 1.01
@@ -876,7 +978,9 @@ def _score_candidate_direction(
         momentum_pts += 5
         reasons.append("触发价略远，需要等待更明确的突破确认。")
     else:
-        reasons.append("触发价距离偏远，本轮候选质量降低。")
+        score -= 6
+        momentum_pts -= 6
+        reasons.append("触发价距离偏远，本轮候选质量降低（扣6分）。")
 
     if entry_last.volume >= 1.25 * vma:
         score += 12
@@ -891,7 +995,7 @@ def _score_candidate_direction(
         direction=direction,
         current=entry_last.close,
         trigger=trigger,
-        recent=entry_candles[-16:],
+        recent=entry_candles[-ENTRY_STOP_LOOKBACK_BARS:],
         atr=atr,
         target_rr=target_rr,
     )
@@ -934,6 +1038,29 @@ def _score_candidate_direction(
         max_hold_hours=max_hold_hours,
         dynamic_hold=dynamic_hold,
     )
+    # Use hold-time plan as a proxy for "trend stage/strength" quality.
+    # Bias toward early/mid-stage trends and penalize late/overheated stages,
+    # since those tend to reduce near-term directional follow-through.
+    hold_adjust = 0
+    if hold_plan.stage == "趋势初段":
+        hold_adjust += 4
+    elif hold_plan.stage == "趋势中段":
+        hold_adjust += 2
+    elif hold_plan.stage == "趋势末段/过热":
+        hold_adjust -= 6
+    elif hold_plan.stage == "趋势未确认":
+        hold_adjust -= 3
+    if hold_plan.strength == "强":
+        hold_adjust += 2
+    elif hold_plan.strength == "弱":
+        hold_adjust -= 2
+    if hold_adjust:
+        score += hold_adjust
+        trend_pts += hold_adjust
+        if hold_adjust > 0:
+            reasons.append(f"持仓因子加分：趋势阶段={hold_plan.stage}，强度={hold_plan.strength}，加{hold_adjust}分。")
+        else:
+            reasons.append(f"持仓因子扣分：趋势阶段={hold_plan.stage}，强度={hold_plan.strength}，扣{abs(hold_adjust)}分。")
     reasons.append(f"持仓时间因子：{hold_plan.detail}")
     final_score = min(99, _clamp_score(score))
     reasons.append(
@@ -1013,6 +1140,19 @@ def evaluate_observation_candidate(
     )
     candidate = long_candidate if long_candidate.score >= short_candidate.score else short_candidate
 
+    # If both directions score similarly, it's usually a noisy / mean-reverting state.
+    # Skip these to improve directional accuracy and avoid alert spam in chop.
+    if long_candidate.direction in {"做多观察", "做空观察"} and short_candidate.direction in {"做多观察", "做空观察"}:
+        gap = abs(long_candidate.score - short_candidate.score)
+        if gap < MIN_DIRECTION_SCORE_GAP:
+            winner = long_candidate if long_candidate.score >= short_candidate.score else short_candidate
+            return replace(
+                winner,
+                score=min(winner.score, 64),
+                level="暂不关注",
+                reasons=winner.reasons + (f"方向置信度过滤：多空评分差距仅 {gap} 分（阈值 {MIN_DIRECTION_SCORE_GAP}），方向不明确，本轮只记录。",),
+            )
+
     if hard_volume_filter and candidate.direction in {"做多观察", "做空观察"}:
         ok, detail = _volume_spike_ok(entry_candles)
         if not ok:
@@ -1023,7 +1163,7 @@ def evaluate_observation_candidate(
                 reasons=candidate.reasons + (f"成交量过滤：{detail}，不满足放量要求，本轮作废。",),
             )
 
-    if hard_short_trend_filter and candidate.direction == "做多观察" and symbol != "BTCUSDT":
+    if hard_short_trend_filter and candidate.direction in {"做多观察", "做空观察"}:
         ok, detail = _short_term_trend_ok(
             entry_candles,
             candidate.direction,
@@ -1034,16 +1174,16 @@ def evaluate_observation_candidate(
                 candidate,
                 score=min(candidate.score, 59),
                 level="暂不关注",
-                reasons=candidate.reasons + (f"短周期趋势过滤：{detail}，币种未处于EMA上升结构，本轮作废。",),
+                reasons=candidate.reasons + (f"短周期趋势过滤：{detail}，15m EMA结构与方向不一致，本轮作废。",),
             )
         if symbol != "BTCUSDT" and market_entry_candles is not None:
-            btc_ok, btc_detail = _short_term_trend_ok(market_entry_candles, "做多观察")
+            btc_ok, btc_detail = _short_term_trend_ok(market_entry_candles, candidate.direction)
             if not btc_ok:
                 return replace(
                     candidate,
                     score=min(candidate.score, 59),
                     level="暂不关注",
-                    reasons=candidate.reasons + (f"BTC短周期趋势过滤：{btc_detail}，BTC未处于EMA上升结构，本轮作废。",),
+                    reasons=candidate.reasons + (f"BTC短周期趋势过滤：{btc_detail}，BTC与本单方向不一致，本轮作废。",),
                 )
 
     if weekly_filter and candidate.direction in {"做多观察", "做空观察"}:

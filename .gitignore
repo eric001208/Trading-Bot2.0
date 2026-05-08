@@ -13,7 +13,10 @@ data/*.xlsx
 
 # Generated outputs (keep repo clean)
 backtest_trades*.csv
+backtest_tmp.csv
 paper_trades.csv
 paper_trades.json
 paper_snapshots/
+tmp_long.csv
+tmp_short.csv
 tmp/

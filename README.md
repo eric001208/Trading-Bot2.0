@@ -128,6 +128,17 @@ python main.py --backtest --backtest-days 7 --score-threshold 90 --hold-hours 2 
 
 交易明细 CSV 包含清晰表头与可读时间（包含 UTC 与本地时间两列）。
 
+入场成交价模型（重要）：
+
+- `--entry-fill-mode close`（默认）：用 5m 确认K线收盘价入场，更保守，但会模拟出“确认后追价成交”的结果
+- `--entry-fill-mode trigger`：按触发价触发成交（类似挂 stop 单），并用 `max(open, trigger)` / `min(open, trigger)` 处理跳空，更接近“突破挂单”的执行方式
+
+如果你真实执行时会在触发价附近挂单，建议回测也使用：
+
+```powershell
+python main.py --backtest --backtest-days 7 --score-threshold 90 --hold-hours 2 --entry-fill-mode trigger --export-trades backtest_trades.csv
+```
+
 ### 5) 方向准确率评估（入场后 N 分钟方向对错）
 
 用于回答“方向对了但止盈止损不合理”的问题：对每一笔回测交易，取入场后 N 分钟的价格，判断方向是否正确，并统计胜率。

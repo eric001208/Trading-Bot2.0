@@ -23,6 +23,10 @@ ACTIVE_STATUSES = {PENDING, OPEN}
 MINUTE_MS = 60_000
 HOUR_MS = 60 * MINUTE_MS
 
+# 5m confirmation candle quality filter: avoid tiny wick pokes through trigger.
+MIN_CONFIRM_BODY_RATIO = 0.45
+MIN_CONFIRM_CLOSE_POS = 0.60
+
 
 @dataclass(frozen=True)
 class PaperTrade:
@@ -615,11 +619,33 @@ def _update_pending_trade(
     return replace(trade, last_checked_ms=last_checked)
 
 
+def _confirmation_candle_quality_ok(direction: str, candle: Candle) -> bool:
+    rng = candle.high - candle.low
+    if rng <= 0:
+        return True
+    body_ratio = abs(candle.close - candle.open) / rng
+    if body_ratio < MIN_CONFIRM_BODY_RATIO:
+        return False
+    if direction == "做多观察":
+        close_pos = (candle.close - candle.low) / rng
+    else:
+        close_pos = (candle.high - candle.close) / rng
+    return close_pos >= MIN_CONFIRM_CLOSE_POS
+
+
 def _is_confirmation_candle(trade: PaperTrade, candle: Candle) -> bool:
     if trade.direction == "做多观察":
-        return candle.close >= trade.trigger_price and candle.close >= candle.open
+        return (
+            candle.close >= trade.trigger_price
+            and candle.close >= candle.open
+            and _confirmation_candle_quality_ok(trade.direction, candle)
+        )
     if trade.direction == "做空观察":
-        return candle.close <= trade.trigger_price and candle.close <= candle.open
+        return (
+            candle.close <= trade.trigger_price
+            and candle.close <= candle.open
+            and _confirmation_candle_quality_ok(trade.direction, candle)
+        )
     return False
 
 

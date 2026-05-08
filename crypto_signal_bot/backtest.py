@@ -17,6 +17,11 @@ FUNDING_INTERVAL_MS = 8 * 60 * 60_000
 DEFAULT_TREND_WINDOW_BARS = 360  # match live scanner (about 15 days of 1h bars)
 DEFAULT_ENTRY_WINDOW_BARS = 180  # match live scanner (about 45 hours of 15m bars)
 
+# Breakout confirmation candle quality filter (5m):
+# require the candle to close with some conviction, not just a tiny poke through the trigger.
+MIN_CONFIRM_BODY_RATIO = 0.45
+MIN_CONFIRM_CLOSE_POS = 0.60
+
 
 @dataclass(frozen=True)
 class BacktestTrade:
@@ -252,6 +257,20 @@ def _make_trade(
     )
 
 
+def _confirmation_candle_quality_ok(direction: str, candle: Candle) -> bool:
+    rng = candle.high - candle.low
+    if rng <= 0:
+        return True
+    body_ratio = abs(candle.close - candle.open) / rng
+    if body_ratio < MIN_CONFIRM_BODY_RATIO:
+        return False
+    if direction == "做多观察":
+        close_pos = (candle.close - candle.low) / rng
+    else:
+        close_pos = (candle.high - candle.close) / rng
+    return close_pos >= MIN_CONFIRM_CLOSE_POS
+
+
 def _r_trailing_stop_price(
     *,
     direction: str,
@@ -282,6 +301,7 @@ def _simulate_exit(
     direction: str,
     score: int,
     entry_candle: Candle,
+    entry_price: float | None = None,
     future_candles: Sequence[Candle],
     stop_loss: float,
     take_profit: float,
@@ -294,7 +314,7 @@ def _simulate_exit(
     trailing_lock_pct: float = 0.015,
     planned_hold_hours: float = 0.0,
 ) -> BacktestTrade:
-    entry = entry_candle.close
+    entry = entry_candle.close if entry_price is None else entry_price
     is_long = direction == "做多观察"
     last = future_candles[-1]
     risk = max(abs(entry - stop_loss), entry * 0.001)
@@ -563,10 +583,18 @@ def _find_confirmation_entry(
         if candle.close_time > deadline:
             break
         if candidate.direction == "做多观察":
-            if candle.close >= candidate.trigger_price and candle.close >= candle.open:
+            if (
+                candle.close >= candidate.trigger_price
+                and candle.close >= candle.open
+                and _confirmation_candle_quality_ok(candidate.direction, candle)
+            ):
                 return candle
         elif candidate.direction == "做空观察":
-            if candle.close <= candidate.trigger_price and candle.close <= candle.open:
+            if (
+                candle.close <= candidate.trigger_price
+                and candle.close <= candle.open
+                and _confirmation_candle_quality_ok(candidate.direction, candle)
+            ):
                 return candle
     return None
 
@@ -648,6 +676,7 @@ def run_observation_backtest_from_candles(
     target_rr: float = 2.0,
     confirm_minutes: int = 10,
     expire_minutes: int = 20,
+    entry_fill_mode: str = "close",
     funding_rate_8h: float = 0.0,
     time_stop_minutes: int = 45,
     min_progress_r: float = 0.35,
@@ -787,11 +816,22 @@ def run_observation_backtest_from_candles(
         if not future:
             break
 
-        risk = abs(confirmed.close - candidate.stop_loss)
-        if candidate.direction == "做多观察":
-            take_profit = confirmed.close + target_rr * risk
+        mode = (entry_fill_mode or "close").strip().lower()
+        if mode == "trigger":
+            if candidate.direction == "做多观察":
+                entry_price = max(candidate.trigger_price, confirmed.open)
+            else:
+                entry_price = min(candidate.trigger_price, confirmed.open)
+        elif mode == "close":
+            entry_price = confirmed.close
         else:
-            take_profit = confirmed.close - target_rr * risk
+            raise ValueError(f"unsupported entry_fill_mode: {entry_fill_mode}")
+
+        risk = abs(entry_price - candidate.stop_loss)
+        if candidate.direction == "做多观察":
+            take_profit = entry_price + target_rr * risk
+        else:
+            take_profit = entry_price - target_rr * risk
 
         trades.append(
             _simulate_exit(
@@ -799,6 +839,7 @@ def run_observation_backtest_from_candles(
                 direction=candidate.direction,
                 score=candidate.score,
                 entry_candle=confirmed,
+                entry_price=entry_price,
                 future_candles=future,
                 stop_loss=candidate.stop_loss,
                 take_profit=take_profit,
@@ -835,6 +876,7 @@ async def run_observation_backtest(
     target_rr: float = 2.0,
     confirm_minutes: int = 10,
     expire_minutes: int = 20,
+    entry_fill_mode: str = "close",
     funding_rate_8h: float = 0.0,
     time_stop_minutes: int = 45,
     min_progress_r: float = 0.35,
@@ -910,6 +952,7 @@ async def run_observation_backtest(
         target_rr=target_rr,
         confirm_minutes=confirm_minutes,
         expire_minutes=expire_minutes,
+        entry_fill_mode=entry_fill_mode,
         funding_rate_8h=funding_rate_8h,
         time_stop_minutes=time_stop_minutes,
         min_progress_r=min_progress_r,

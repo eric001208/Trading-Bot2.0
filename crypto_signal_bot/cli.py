@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import csv
 import logging
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1065,6 +1065,9 @@ class DirectionAccuracy:
     wins: int
     ties: int
     avg_move_pct: float
+    mfe_hit: int
+    avg_mfe_pct: float
+    avg_mae_pct: float
 
     @property
     def win_rate(self) -> float:
@@ -1076,6 +1079,7 @@ async def _direction_accuracy_1h(
     trades_csv: str,
     horizon_minutes: int,
     min_move_pct: float,
+    mfe_threshold_pct: float,
 ) -> None:
     """
     Evaluate directional correctness after a fixed horizon.
@@ -1094,6 +1098,8 @@ async def _direction_accuracy_1h(
         raise ValueError("--direction-horizon-minutes 必须大于 0")
     if min_move_pct < 0:
         raise ValueError("--direction-min-move-pct 不能小于 0")
+    if mfe_threshold_pct < 0:
+        raise ValueError("--direction-mfe-threshold-pct 不能小于 0")
 
     rows: list[dict[str, str]] = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -1141,7 +1147,7 @@ async def _direction_accuracy_1h(
         "，".join(sorted(by_symbol)),
     )
 
-    candles_by_symbol: dict[str, tuple[list[int], list[float]]] = {}
+    candles_by_symbol: dict[str, tuple[list[int], list[float], list[float], list[float]]] = {}
     # Provide a small pad to avoid missing the last eval point.
     start_ms = max(0, min_entry_ms - 6 * 60_000)
     end_ms = max_eval_ms + 6 * 60_000
@@ -1155,26 +1161,50 @@ async def _direction_accuracy_1h(
         candles = [Candle.from_kline(k) for k in klines]
         close_times = [c.close_time for c in candles]
         closes_ = [c.close for c in candles]
-        candles_by_symbol[symbol] = (close_times, closes_)
+        highs_ = [c.high for c in candles]
+        lows_ = [c.low for c in candles]
+        candles_by_symbol[symbol] = (close_times, closes_, highs_, lows_)
         logger.info("%s 5m K线载入完成：%s 根", symbol, len(candles))
 
-    def evaluate(group: list[tuple[str, int, float]], series: tuple[list[int], list[float]]) -> DirectionAccuracy:
-        close_times, closes_ = series
+    def evaluate(
+        group: list[tuple[str, int, float]],
+        series: tuple[list[int], list[float], list[float], list[float]],
+    ) -> DirectionAccuracy:
+        close_times, closes_, highs_, lows_ = series
         total = 0
         wins = 0
         ties = 0
         sum_move = 0.0
+        sum_mfe = 0.0
+        sum_mae = 0.0
+        mfe_hit = 0
         for direction, entry_ms, entry_price in group:
             eval_ms = entry_ms + horizon_ms
-            idx = bisect_left(close_times, eval_ms)
-            if idx >= len(closes_) or entry_price <= 0:
+            idx_eval = bisect_left(close_times, eval_ms)
+            if idx_eval >= len(closes_) or entry_price <= 0:
                 continue
-            price = closes_[idx]
+            price = closes_[idx_eval]
             move = (price - entry_price) / entry_price
             total += 1
             # move in the "favorable" direction for averaging.
             favorable_move = move if direction == "做多观察" else -move
             sum_move += favorable_move * 100
+
+            # Window excursion (exclude entry candle itself to avoid using pre-entry high/low).
+            idx_start = bisect_right(close_times, entry_ms)
+            if idx_start <= idx_eval:
+                window_high = max(highs_[idx_start : idx_eval + 1])
+                window_low = min(lows_[idx_start : idx_eval + 1])
+                if direction == "做多观察":
+                    mfe = (window_high - entry_price) / entry_price * 100
+                    mae = (window_low - entry_price) / entry_price * 100
+                else:
+                    mfe = (entry_price - window_low) / entry_price * 100
+                    mae = (entry_price - window_high) / entry_price * 100
+                sum_mfe += mfe
+                sum_mae += mae
+                if mfe >= mfe_threshold_pct:
+                    mfe_hit += 1
 
             threshold = min_move_pct / 100.0
             if abs(move) <= threshold:
@@ -1187,16 +1217,30 @@ async def _direction_accuracy_1h(
                 if move < -threshold:
                     wins += 1
         avg_move = (sum_move / total) if total else 0.0
-        return DirectionAccuracy(total=total, wins=wins, ties=ties, avg_move_pct=avg_move)
+        avg_mfe = (sum_mfe / total) if total else 0.0
+        avg_mae = (sum_mae / total) if total else 0.0
+        return DirectionAccuracy(
+            total=total,
+            wins=wins,
+            ties=ties,
+            avg_move_pct=avg_move,
+            mfe_hit=mfe_hit,
+            avg_mfe_pct=avg_mfe,
+            avg_mae_pct=avg_mae,
+        )
 
     overall_total = 0
     overall_wins = 0
     overall_ties = 0
     overall_move_sum = 0.0
+    overall_mfe_hit = 0
+    overall_mfe_sum = 0.0
+    overall_mae_sum = 0.0
 
     print("")
     print(f"方向准确率评估（{horizon_minutes}分钟）")
     print(f"判定阈值：|涨跌幅| <= {min_move_pct:.4f}% 视为平局")
+    print(f"窗口统计：在 {horizon_minutes} 分钟内，达到有利波动 >= {mfe_threshold_pct:.3f}% 记为一次 MFE 命中")
     print(f"数据来源：{trades_csv}")
     print("")
     for symbol in sorted(by_symbol):
@@ -1205,17 +1249,27 @@ async def _direction_accuracy_1h(
         overall_wins += acc.wins
         overall_ties += acc.ties
         overall_move_sum += acc.avg_move_pct * acc.total
+        overall_mfe_hit += acc.mfe_hit
+        overall_mfe_sum += acc.avg_mfe_pct * acc.total
+        overall_mae_sum += acc.avg_mae_pct * acc.total
         print(
             f"{symbol}：胜率 {acc.win_rate * 100:.2f}%（{acc.wins}/{acc.total}），"
-            f"平局 {acc.ties}，平均有利波动 {acc.avg_move_pct:+.3f}%"
+            f"平局 {acc.ties}，平均有利波动 {acc.avg_move_pct:+.3f}%\n"
+            f"  1) MFE命中率 {acc.mfe_hit / acc.total * 100:.2f}%（{acc.mfe_hit}/{acc.total}）"
+            f"  2) 平均MFE {acc.avg_mfe_pct:+.3f}%  3) 平均MAE {acc.avg_mae_pct:+.3f}%"
         )
 
     overall_avg_move = (overall_move_sum / overall_total) if overall_total else 0.0
     overall_win_rate = (overall_wins / overall_total) if overall_total else 0.0
+    overall_mfe_rate = (overall_mfe_hit / overall_total) if overall_total else 0.0
+    overall_avg_mfe = (overall_mfe_sum / overall_total) if overall_total else 0.0
+    overall_avg_mae = (overall_mae_sum / overall_total) if overall_total else 0.0
     print("")
     print(
         f"总体：胜率 {overall_win_rate * 100:.2f}%（{overall_wins}/{overall_total}），"
-        f"平局 {overall_ties}，平均有利波动 {overall_avg_move:+.3f}%"
+        f"平局 {overall_ties}，平均有利波动 {overall_avg_move:+.3f}%\n"
+        f"  1) MFE命中率 {overall_mfe_rate * 100:.2f}%（{overall_mfe_hit}/{overall_total}）"
+        f"  2) 平均MFE {overall_avg_mfe:+.3f}%  3) 平均MAE {overall_avg_mae:+.3f}%"
     )
 
 
@@ -1267,6 +1321,7 @@ async def _backtest(
     target_rr: float,
     confirm_minutes: int,
     expire_minutes: int,
+    entry_fill_mode: str,
     min_hold_hours: float,
     max_hold_hours: float,
     dynamic_hold: bool,
@@ -1334,6 +1389,7 @@ async def _backtest(
             target_rr=target_rr,
             confirm_minutes=confirm_minutes,
             expire_minutes=expire_minutes,
+            entry_fill_mode=entry_fill_mode,
             min_hold_hours=min_hold_hours,
             max_hold_hours=max_hold_hours,
             dynamic_hold=dynamic_hold,
@@ -1568,6 +1624,12 @@ def main() -> None:
         help="候选备案过期时间，默认20分钟",
     )
     parser.add_argument(
+        "--entry-fill-mode",
+        default="close",
+        choices=["close", "trigger"],
+        help="回测入场成交价模型：close=用5m确认K线收盘价入场（更保守）；trigger=按触发价触发成交（更接近挂单触发）",
+    )
+    parser.add_argument(
         "--time-stop-minutes",
         type=int,
         default=45,
@@ -1636,6 +1698,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help="方向准确率评估：|涨跌幅|<=该值(百分比) 视为平局，默认0",
+    )
+    parser.add_argument(
+        "--direction-mfe-threshold-pct",
+        type=float,
+        default=0.3,
+        help="方向准确率评估：窗口内最大有利波动(MFE)达到该阈值(百分比)记为命中，默认0.3",
     )
     parser.add_argument(
         "--notify",
@@ -1832,6 +1900,7 @@ def main() -> None:
                 target_rr=args.target_rr,
                 confirm_minutes=args.confirm_minutes,
                 expire_minutes=args.expire_minutes,
+                entry_fill_mode=args.entry_fill_mode,
                 min_hold_hours=args.min_hold_hours,
                 max_hold_hours=args.max_hold_hours,
                 dynamic_hold=not args.fixed_hold,
@@ -1868,6 +1937,7 @@ def main() -> None:
                 trades_csv=args.direction_trades_csv,
                 horizon_minutes=args.direction_horizon_minutes,
                 min_move_pct=args.direction_min_move_pct,
+                mfe_threshold_pct=args.direction_mfe_threshold_pct,
             )
         )
         logger.info("方向准确率评估完成")
