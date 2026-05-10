@@ -1147,7 +1147,7 @@ def _soft_score_and_hard_filters(
     er = _efficiency_ratio(trend_candles, TREND_EFFICIENCY_LOOKBACK_BARS)
     move_6h = _directional_pct_change(trend_candles, 6, direction)
 
-    regime = market_regime or detect_market_regime(trend_candles=trend_candles, entry_candles=entry_candles)
+    state = market_regime or detect_market_regime(trend_candles=trend_candles, entry_candles=entry_candles)
 
     hard_status: dict[str, str] = {}
     hard_detail: dict[str, str] = {}
@@ -1180,11 +1180,11 @@ def _soft_score_and_hard_filters(
 
     # --- hard filters ---
     # Market regime filter (stateful filter beyond pure indicator thresholds)
-    if regime.regime == "unknown":
+    if state.regime == "unknown":
         _fail("not_in_chop_zone", "市场状态=unknown（数据不足/状态不明），保守起见不允许交易。")
-    if regime.no_trade_zone:
+    if state.no_trade_zone:
         _fail("not_in_chop_zone", "no_trade_zone=true（价格在区间中部40%-60%），不允许交易。")
-    if regime.regime == "range":
+    if state.regime == "range":
         _fail("not_in_chop_zone", "市场状态=range（震荡市），不允许 breakout 直接开单。")
     # compression: allowed, but must wait for trigger confirmation (paper default confirm mode).
 
@@ -1235,11 +1235,11 @@ def _soft_score_and_hard_filters(
             _fail("higher_timeframe_trend_aligned", f"BTC周趋势过滤：{market_weekly.detail}")
         elif (not is_long) and not market_weekly.allows_short:
             _fail("higher_timeframe_trend_aligned", f"BTC周趋势过滤：{market_weekly.detail}")
-        regime = classify_market_regime(market_candles)
-        if is_long and not regime.allows_long:
-            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{regime.detail}")
-        elif (not is_long) and not regime.allows_short:
-            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{regime.detail}")
+        market_bias = classify_market_regime(market_candles)
+        if is_long and not market_bias.allows_long:
+            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{market_bias.detail}")
+        elif (not is_long) and not market_bias.allows_short:
+            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{market_bias.detail}")
 
     # 2) not_in_chop_zone
     # Note: we intentionally keep this independent of score; if some data is missing, mark unavailable.
@@ -1444,8 +1444,8 @@ def _soft_score_and_hard_filters(
                 btc_env_score += 4.0
             elif (not is_long) and rel <= -0.002:
                 btc_env_score += 4.0
-        regime = classify_market_regime(market_candles)
-        if (is_long and regime.direction == "偏强") or ((not is_long) and regime.direction == "偏弱"):
+        market_bias = classify_market_regime(market_candles)
+        if (is_long and market_bias.direction == "偏强") or ((not is_long) and market_bias.direction == "偏弱"):
             btc_env_score += 4.0
 
     # Hold-time plan as "stage/strength" quality
@@ -1492,10 +1492,10 @@ def _soft_score_and_hard_filters(
     # If some filters are unavailable, they do NOT block entry yet; we only log them.
     components = {
         "market_regime": {
-            "regime": regime.regime,
-            "confidence": int(regime.confidence),
-            "no_trade_zone": bool(regime.no_trade_zone),
-            "reasons": list(regime.reasons),
+            "regime": state.regime,
+            "confidence": int(state.confidence),
+            "no_trade_zone": bool(state.no_trade_zone),
+            "reasons": list(state.reasons),
         },
         "soft_score": {
             "trend": round(trend_score, 6),
@@ -1537,7 +1537,7 @@ def _soft_score_and_hard_filters(
         else:
             legacy_reasons.append(r)
     regime_line = (
-        f"市场状态：{regime.regime}（confidence={int(regime.confidence)}/100，no_trade_zone={bool(regime.no_trade_zone)}）"
+        f"市场状态：{state.regime}（confidence={int(state.confidence)}/100，no_trade_zone={bool(state.no_trade_zone)}）"
     )
     hard_line = (
         f"硬过滤：{'通过' if hard_passed else '失败'}；failed={','.join(failed) if failed else '-'}；"
@@ -1559,10 +1559,10 @@ def _soft_score_and_hard_filters(
         raw_score=float(raw_score),
         final_score=int(final_score),
         score_components_json=components_json,
-        market_regime=str(regime.regime),
-        market_regime_confidence=int(regime.confidence),
-        no_trade_zone=bool(regime.no_trade_zone),
-        market_regime_reasons=tuple(regime.reasons),
+        market_regime=str(state.regime),
+        market_regime_confidence=int(state.confidence),
+        no_trade_zone=bool(state.no_trade_zone),
+        market_regime_reasons=tuple(state.reasons),
         reasons=tuple(legacy_reasons + [regime_line, hard_line, soft_line]),
         # Keep hold plan hours from legacy candidate (already dynamic); don't overwrite.
     )
