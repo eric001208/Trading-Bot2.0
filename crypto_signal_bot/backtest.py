@@ -271,6 +271,182 @@ def _confirmation_candle_quality_ok(direction: str, candle: Candle) -> bool:
     return close_pos >= MIN_CONFIRM_CLOSE_POS
 
 
+def _avg_true_range(candles: Sequence[Candle], period: int = 14) -> float | None:
+    if len(candles) < period + 1:
+        return None
+    ranges: list[float] = []
+    for i in range(len(candles) - period, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]
+        ranges.append(max(c.high - c.low, abs(c.high - prev.close), abs(c.low - prev.close)))
+    return sum(ranges) / period
+
+
+def _risk_r_from_trigger(candidate: ObservationCandidate) -> float:
+    if candidate.direction == "做多观察":
+        return max(candidate.trigger_price - candidate.stop_loss, 1e-12)
+    if candidate.direction == "做空观察":
+        return max(candidate.stop_loss - candidate.trigger_price, 1e-12)
+    return 1e-12
+
+
+def _entry_slippage_r(candidate: ObservationCandidate, entry_price: float) -> float:
+    r = _risk_r_from_trigger(candidate)
+    if candidate.direction == "做多观察":
+        return (entry_price - candidate.trigger_price) / r
+    if candidate.direction == "做空观察":
+        return (candidate.trigger_price - entry_price) / r
+    return 0.0
+
+
+def _trigger_candle_atr_multiple(candle: Candle, atr: float) -> float:
+    rng = candle.high - candle.low
+    body = abs(candle.close - candle.open)
+    if atr <= 0:
+        return 0.0
+    return max(rng, body) / atr
+
+
+def _pullback_entry_ok(candidate: ObservationCandidate, candle: Candle, *, tolerance_r: float = 0.0) -> bool:
+    """
+    Pullback entry check (for both breakout confirmation mode and no-chase wait-pullback).
+
+    tolerance_r:
+    - interpreted as an R-multiple tolerance around trigger_price
+    - long: allow low <= trigger + tol_r*R, but require close back >= trigger
+    - short: allow high >= trigger - tol_r*R, but require close back <= trigger
+
+    Default tolerance_r=0 keeps backward-compatible behavior (touch trigger then close back across trigger).
+    """
+    r = _risk_r_from_trigger(candidate)
+    tol = max(0.0, float(tolerance_r)) * r
+    if candidate.direction == "做多观察":
+        return candle.low <= (candidate.trigger_price + tol) and candle.close >= candidate.trigger_price
+    if candidate.direction == "做空观察":
+        return candle.high >= (candidate.trigger_price - tol) and candle.close <= candidate.trigger_price
+    return False
+
+
+def _pending_should_cancel(candidate: ObservationCandidate, candle: Candle) -> bool:
+    # Cancel a pending setup if stop is hit before entry.
+    if candidate.direction == "做多观察":
+        return candle.low <= candidate.stop_loss
+    if candidate.direction == "做空观察":
+        return candle.high >= candidate.stop_loss
+    return False
+
+
+def _is_confirmation_candle(candidate: ObservationCandidate, candle: Candle) -> bool:
+    # Close-based confirmation with basic candle-quality guard.
+    if candidate.direction == "做多观察":
+        return (
+            candle.close >= candidate.trigger_price
+            and candle.close >= candle.open
+            and _confirmation_candle_quality_ok(candidate.direction, candle)
+        )
+    if candidate.direction == "做空观察":
+        return (
+            candle.close <= candidate.trigger_price
+            and candle.close <= candle.open
+            and _confirmation_candle_quality_ok(candidate.direction, candle)
+        )
+    return False
+
+
+def _is_breakout_confirmed(candidate: ObservationCandidate, candle: Candle, *, mode: str) -> bool:
+    """
+    Breakout confirmation check.
+
+    Modes:
+    - legacy: treat trigger as "touched" intrabar (high/low), for A/B comparisons
+    - others: close-based confirmation (non-repainting)
+    """
+    m = (mode or "").strip().lower()
+    if m == "legacy":
+        if candidate.direction == "做多观察":
+            return candle.high >= candidate.trigger_price
+        if candidate.direction == "做空观察":
+            return candle.low <= candidate.trigger_price
+        return False
+    return _is_confirmation_candle(candidate, candle)
+
+
+def _normalize_breakout_confirmation_mode(mode: str) -> str:
+    m = (mode or "close_and_hold").strip().lower()
+    if m not in {"legacy", "close_only", "close_and_hold", "close_and_pullback"}:
+        return "close_and_hold"
+    return m
+
+
+def _find_breakout_candle(
+    *,
+    candidate: ObservationCandidate,
+    confirmation_candles: Sequence[Candle],
+    candidate_close_time_ms: int,
+    confirm_minutes: int,
+    expire_minutes: int,
+    breakout_confirmation_mode: str,
+    cancel_if_stop_before_trigger: bool,
+) -> Candle | None:
+    confirm_deadline = candidate_close_time_ms + confirm_minutes * 60_000
+    expire_deadline = candidate_close_time_ms + expire_minutes * 60_000
+    deadline = min(confirm_deadline, expire_deadline)
+    mode = _normalize_breakout_confirmation_mode(breakout_confirmation_mode)
+
+    for candle in confirmation_candles:
+        if candle.close_time <= candidate_close_time_ms:
+            continue
+        if candle.close_time > deadline:
+            break
+        if cancel_if_stop_before_trigger and _pending_should_cancel(candidate, candle):
+            return None
+        if _is_breakout_confirmed(candidate, candle, mode=mode):
+            return candle
+    return None
+
+
+def _find_hold_confirmation_entry(
+    *,
+    candidate: ObservationCandidate,
+    hold_candles: Sequence[Candle],
+    required_candles: int,
+    cancel_if_stop_before_trigger: bool,
+) -> Candle | None:
+    required = max(1, int(required_candles))
+    seen = 0
+    for candle in hold_candles:
+        if cancel_if_stop_before_trigger and _pending_should_cancel(candidate, candle):
+            return None
+        if candidate.direction == "做多观察" and candle.close < candidate.trigger_price:
+            return None
+        if candidate.direction == "做空观察" and candle.close > candidate.trigger_price:
+            return None
+        seen += 1
+        if seen >= required:
+            return candle
+    return None
+
+
+def _find_pullback_entry(
+    *,
+    candidate: ObservationCandidate,
+    pullback_candles: Sequence[Candle],
+    pullback_tolerance_r: float,
+    cancel_if_stop_before_trigger: bool,
+    max_entry_slippage_r: float,
+) -> Candle | None:
+    for candle in pullback_candles:
+        if cancel_if_stop_before_trigger and _pending_should_cancel(candidate, candle):
+            return None
+        if not _pullback_entry_ok(candidate, candle, tolerance_r=pullback_tolerance_r):
+            continue
+        # Re-check slippage at the pullback entry close to avoid chasing on large bounces.
+        if _entry_slippage_r(candidate, candle.close) > float(max_entry_slippage_r):
+            continue
+        return candle
+    return None
+
+
 def _r_trailing_stop_price(
     *,
     direction: str,
@@ -676,7 +852,15 @@ def run_observation_backtest_from_candles(
     target_rr: float = 2.0,
     confirm_minutes: int = 10,
     expire_minutes: int = 20,
+    breakout_confirmation_mode: str = "close_and_hold",
+    hold_confirmation_candles: int = 1,
+    pullback_tolerance_r: float = 0.25,
+    pullback_expire_minutes: int = 30,
+    cancel_if_stop_before_trigger: bool = True,
     entry_fill_mode: str = "close",
+    max_entry_slippage_r: float = 0.5,
+    max_trigger_candle_atr_multiple: float = 1.2,
+    wait_pullback_if_chased: bool = True,
     funding_rate_8h: float = 0.0,
     time_stop_minutes: int = 45,
     min_progress_r: float = 0.35,
@@ -722,6 +906,17 @@ def run_observation_backtest_from_candles(
             return []
         start_idx = bisect_right(lower_close_times, start_after_ms)
         end_idx = bisect_right(lower_close_times, end_at_ms)
+        return lower_timeframe[start_idx:end_idx]
+
+    def _atr_context_for_trigger(trigger_close_time_ms: int, lookback_bars: int = 40) -> list[Candle]:
+        """
+        Return enough lower-timeframe candles for ATR(14) and trigger-candle ATR-multiple checks.
+
+        We intentionally use the full lower-timeframe history passed to the backtest (not just the pending window),
+        so ATR is available even when expire_minutes is small (e.g. 20 minutes -> only ~4x 5m candles).
+        """
+        end_idx = bisect_right(lower_close_times, trigger_close_time_ms)
+        start_idx = max(0, end_idx - max(int(lookback_bars), 20))
         return lower_timeframe[start_idx:end_idx]
 
     while i <= last_entry_index:
@@ -778,6 +973,10 @@ def run_observation_backtest_from_candles(
         if allowed_directions is not None and candidate.direction not in allowed_directions:
             i += 1
             continue
+        # Hard filters gate entry: if any hard filter failed, do not create a pending/triggered trade in backtest.
+        if candidate.direction in {"做多观察", "做空观察"} and not bool(getattr(candidate, "hard_filter_passed", True)):
+            i += 1
+            continue
         required_score = _threshold_for_candidate(candidate, score_threshold, direction_thresholds)
         if candidate.score < required_score or candidate.direction not in {"做多观察", "做空观察"}:
             i += 1
@@ -799,22 +998,44 @@ def run_observation_backtest_from_candles(
             continue
 
         pending = _between(candidate_close_time, candidate_close_time + expire_minutes * 60_000)
-        confirmed = _find_confirmation_entry(
+        mode = _normalize_breakout_confirmation_mode(breakout_confirmation_mode)
+        breakout = _find_breakout_candle(
             candidate=candidate,
             confirmation_candles=pending,
             candidate_close_time_ms=candidate_close_time,
             confirm_minutes=confirm_minutes,
             expire_minutes=expire_minutes,
+            breakout_confirmation_mode=mode,
+            cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
         )
+        if breakout is None:
+            i += max(1, int(round(expire_minutes / 15)))
+            continue
+
+        confirmed = breakout
+        if mode == "close_and_hold":
+            hold_window = _between(breakout.close_time, candidate_close_time + expire_minutes * 60_000)
+            confirmed = _find_hold_confirmation_entry(
+                candidate=candidate,
+                hold_candles=hold_window,
+                required_candles=hold_confirmation_candles,
+                cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
+            )
+        elif mode == "close_and_pullback":
+            pullback_window = _between(breakout.close_time, breakout.close_time + pullback_expire_minutes * 60_000)
+            confirmed = _find_pullback_entry(
+                candidate=candidate,
+                pullback_candles=pullback_window,
+                pullback_tolerance_r=pullback_tolerance_r,
+                cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
+                max_entry_slippage_r=max_entry_slippage_r,
+            )
         if confirmed is None:
             i += max(1, int(round(expire_minutes / 15)))
             continue
 
         planned_hold_hours = candidate.expected_hold_hours if dynamic_hold else hold_hours
         planned_hold_ms = int(planned_hold_hours * 60 * 60_000)
-        future = _between(confirmed.close_time, confirmed.close_time + planned_hold_ms)
-        if not future:
-            break
 
         mode = (entry_fill_mode or "close").strip().lower()
         if mode == "trigger":
@@ -826,6 +1047,45 @@ def run_observation_backtest_from_candles(
             entry_price = confirmed.close
         else:
             raise ValueError(f"unsupported entry_fill_mode: {entry_fill_mode}")
+
+        # No-chase rule: avoid FOMO when the confirmed breakout candle already ran too far.
+        # If we are "chased", we can optionally wait for a pullback to the trigger area before entering.
+        slippage_r = _entry_slippage_r(candidate, entry_price)
+        fail_reasons: list[str] = []
+        if slippage_r > float(max_entry_slippage_r):
+            fail_reasons.append(f"entry_slippage_r={slippage_r:.2f} > {float(max_entry_slippage_r):.2f}")
+
+        atr = _avg_true_range(_atr_context_for_trigger(confirmed.close_time), 14)
+        if atr is not None and atr > 0:
+            atr_multiple = _trigger_candle_atr_multiple(confirmed, atr)
+            if atr_multiple > float(max_trigger_candle_atr_multiple):
+                fail_reasons.append(
+                    f"trigger_candle_atr_multiple={atr_multiple:.2f} > {float(max_trigger_candle_atr_multiple):.2f}"
+                )
+
+        if fail_reasons:
+            if wait_pullback_if_chased:
+                pullback_deadline = confirmed.close_time + pullback_expire_minutes * 60_000
+                pullback_window = _between(confirmed.close_time, pullback_deadline)
+                pullback_entry = _find_pullback_entry(
+                    candidate=candidate,
+                    pullback_candles=pullback_window,
+                    pullback_tolerance_r=pullback_tolerance_r,
+                    cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
+                    max_entry_slippage_r=max_entry_slippage_r,
+                )
+                if pullback_entry is None:
+                    i += max(1, int(round(expire_minutes / 15)))
+                    continue
+                confirmed = pullback_entry
+                entry_price = confirmed.close
+            else:
+                i += max(1, int(round(expire_minutes / 15)))
+                continue
+
+        future = _between(confirmed.close_time, confirmed.close_time + planned_hold_ms)
+        if not future:
+            break
 
         risk = abs(entry_price - candidate.stop_loss)
         if candidate.direction == "做多观察":
@@ -876,7 +1136,16 @@ async def run_observation_backtest(
     target_rr: float = 2.0,
     confirm_minutes: int = 10,
     expire_minutes: int = 20,
+    confirmation_candle: str = "5m",
+    breakout_confirmation_mode: str = "close_and_hold",
+    hold_confirmation_candles: int = 1,
+    pullback_tolerance_r: float = 0.25,
+    pullback_expire_minutes: int = 30,
+    cancel_if_stop_before_trigger: bool = True,
     entry_fill_mode: str = "close",
+    max_entry_slippage_r: float = 0.5,
+    max_trigger_candle_atr_multiple: float = 1.2,
+    wait_pullback_if_chased: bool = True,
     funding_rate_8h: float = 0.0,
     time_stop_minutes: int = 45,
     min_progress_r: float = 0.35,
@@ -912,7 +1181,7 @@ async def run_observation_backtest(
     )
     confirmation_klines = await fetch_usdm_klines_range(
         symbol=symbol,
-        interval="5m",
+        interval=confirmation_candle,
         start_time_ms=start_ms,
         end_time_ms=end_ms,
     )
@@ -952,7 +1221,15 @@ async def run_observation_backtest(
         target_rr=target_rr,
         confirm_minutes=confirm_minutes,
         expire_minutes=expire_minutes,
+        breakout_confirmation_mode=breakout_confirmation_mode,
+        hold_confirmation_candles=hold_confirmation_candles,
+        pullback_tolerance_r=pullback_tolerance_r,
+        pullback_expire_minutes=pullback_expire_minutes,
+        cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
         entry_fill_mode=entry_fill_mode,
+        max_entry_slippage_r=max_entry_slippage_r,
+        max_trigger_candle_atr_multiple=max_trigger_candle_atr_multiple,
+        wait_pullback_if_chased=wait_pullback_if_chased,
         funding_rate_8h=funding_rate_8h,
         time_stop_minutes=time_stop_minutes,
         min_progress_r=min_progress_r,

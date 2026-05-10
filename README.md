@@ -68,7 +68,7 @@ python main.py --scan-market --score-threshold 90 --notify
 - `--dynamic-alt-limit 3`：每日从活跃币中筛选最多 N 个“放量/波动”山寨机会
 - `--symbol-cooldown-minutes 60`：同币种同方向冷却，减少重复信号
 - `--paper-record --paper-path paper_trades.json`：把达到阈值的信号写入模拟盘账本
-- `--paper-entry-mode immediate|confirm`：模拟盘入场方式（默认 `immediate`）
+- `--paper-entry-mode immediate|confirm`：模拟盘入场方式（默认 `confirm`；用 `immediate` 可回到旧逻辑做 A/B 对比）
 
 通知去重与增强确认（推荐开启 `--paper-record`）：
 
@@ -113,6 +113,13 @@ python main.py --run-live `
 ```powershell
 python main.py --paper-sync --paper-path paper_trades.json --notify
 ```
+
+no-chase（仅影响 paper/backtest 入场，不影响 Telegram“观察信号”通知）：
+
+- `--max-entry-slippage-r 0.5`：触发确认后，若实际入场价偏离 trigger 过远（以 R 倍数计），不追单
+- `--max-trigger-candle-atr-multiple 1.2`：触发确认K线若波动过大（相对 ATR），不追单
+- `--wait-pullback-if-chased`（默认开启）：不追单时先进入 `wait_pullback`，等待回踩/反抽到 trigger 区域再入场
+- `--no-wait-pullback-if-chased`：关闭回踩等待，直接跳过该笔 setup（便于对比）
 
 只看模拟盘摘要：
 
@@ -174,8 +181,43 @@ python main.py --direction-eval `
 - 资金费率与手续费在回测与模拟盘中会计入收益
 - 交易推进包含：止损/分批止盈/移动止损/时间止损/到期平仓等
 
+## Breakout 入场确认（更严格）
+
+为了降低假突破，虚拟盘/回测的 breakout 入场默认不再是“触发价一到就进场”，而是一个更严格的确认模型：
+
+`pending -> breakout_confirmed -> (waiting_hold_confirmation | waiting_pullback) -> triggered -> open -> closed`
+
+核心参数（都在 `--help` 里）：
+
+- `--breakout-confirmation-mode`：`close_only | close_and_hold | close_and_pullback | legacy`（默认 `close_and_hold`）
+- `--confirmation-candle`（同 `--trigger-candle`）：确认用的 K 线周期（默认 `5m`）
+- `--hold-confirmation-candles`：`close_and_hold` 需要额外“持稳”的 candle 根数（默认 `1`）
+- `--pullback-tolerance-r`：回踩/反抽允许的误差（R 倍数，默认 `0.25`）
+- `--pullback-expire-minutes`：等待回踩超时分钟数（默认 `30`）
+
+说明：
+
+- `legacy` 用于 A/B 对比，会把突破判定当作 intrabar “触碰触发价”（high/low）
+- `--paper-entry-mode immediate` 也可用于回到“信号直接入场”的旧逻辑（不走 pending/trigger）
+
+示例命令：
+
+1. 使用更严格的确认（默认就是这个）：
+
+```powershell
+python main.py --run-live --loop-minutes 1 --paper-record --notify --breakout-confirmation-mode close_and_hold
+```
+
+2. 使用旧突破触碰逻辑做对比：
+
+```powershell
+python main.py --run-live --loop-minutes 1 --paper-record --notify --breakout-confirmation-mode legacy
+```
+
 ## 开发与测试
 
 ```powershell
 python -m pytest -q
 ```
+#   T r a d i n g - B o t 2 . 0  
+ 

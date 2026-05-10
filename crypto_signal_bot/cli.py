@@ -20,9 +20,13 @@ from crypto_signal_bot.logging_setup import configure_logging
 from crypto_signal_bot.market import fetch_top_usdm_symbols_by_quote_volume, fetch_usdm_klines, fetch_usdm_klines_range
 from crypto_signal_bot.models import Candle
 from crypto_signal_bot.paper import (
+    BREAKOUT_CONFIRMED,
     CLOSED,
     OPEN,
     PENDING,
+    WAIT_PULLBACK,
+    WAITING_HOLD_CONFIRMATION,
+    TRIGGERED,
     PaperTrade,
     export_paper_trades,
     load_paper_trades,
@@ -30,6 +34,7 @@ from crypto_signal_bot.paper import (
     record_signal_candidates,
     sync_paper_trades,
 )
+from crypto_signal_bot.risk_filter import RiskFilterConfig, append_skipped_signals, filter_signals
 from crypto_signal_bot.strategies import evaluate_observation_candidate, evaluate_pullback_long
 
 logger = logging.getLogger(__name__)
@@ -195,7 +200,7 @@ def _find_matching_active_trade(trades: Sequence[PaperTrade], candidate) -> Pape
     best: PaperTrade | None = None
     best_time = -1
     for trade in trades:
-        if trade.status not in {PENDING, OPEN}:
+        if trade.status not in {PENDING, BREAKOUT_CONFIRMED, WAITING_HOLD_CONFIRMATION, WAIT_PULLBACK, TRIGGERED, OPEN}:
             continue
         if trade.symbol != symbol or trade.direction != direction:
             continue
@@ -216,12 +221,23 @@ def _format_ms_local(time_ms: int | None) -> str:
 
 
 def _enhanced_confirmation_message(candidate, trade: PaperTrade) -> str:
-    status = "待触发" if trade.status == PENDING else "持仓中"
+    if trade.status == PENDING:
+        status = "待触发"
+    elif trade.status == BREAKOUT_CONFIRMED:
+        status = "突破已确认"
+    elif trade.status == WAITING_HOLD_CONFIRMATION:
+        status = "等待持稳确认"
+    elif trade.status == WAIT_PULLBACK:
+        status = "等待回踩"
+    elif trade.status == TRIGGERED:
+        status = "已触发"
+    else:
+        status = "持仓中"
     entry_hint = ""
-    if trade.status == OPEN and trade.entry_time_ms is not None:
+    if trade.status in {TRIGGERED, OPEN} and trade.entry_time_ms is not None:
         entry_hint = f"\n入场价：{trade.entry_price:g}（{_format_ms_local(trade.entry_time_ms)}）"
     pnl_hint = ""
-    if trade.status == OPEN and trade.entry_price > 0:
+    if trade.status in {TRIGGERED, OPEN} and trade.entry_price > 0:
         pnl_hint = f"\n浮动盈亏：{trade.unrealized_pnl_pct * 100:.2f}%（最新价 {trade.last_price:g}）"
 
     return (
@@ -237,13 +253,30 @@ def _enhanced_confirmation_message(candidate, trade: PaperTrade) -> str:
     )
 
 
-def _paper_event_messages(before: Sequence[PaperTrade], after: Sequence[PaperTrade]) -> list[str]:
+def _paper_event_messages(
+    before: Sequence[PaperTrade],
+    after: Sequence[PaperTrade],
+    *,
+    include_triggered_entry: bool = False,
+) -> list[str]:
     before_by_id = {t.paper_id: t for t in before}
     out: list[str] = []
     for trade in after:
         prev = before_by_id.get(trade.paper_id)
         if prev is None:
             continue
+        if include_triggered_entry and (not prev.trigger_confirmed) and trade.trigger_confirmed:
+            out.append(
+                (
+                    f"已触发入场：{trade.symbol} {trade.direction}\n\n"
+                    f"触发阈值：{trade.trigger_price:g}\n"
+                    f"触发成交价：{trade.trigger_fill_price:g}（{_format_ms_local(trade.trigger_time_ms)}）\n"
+                    f"入场：{trade.entry_price:g}（{_format_ms_local(trade.entry_time_ms)}）\n"
+                    f"止损：{trade.stop_loss:g}\n"
+                    f"TP1：{trade.tp1_price:g}｜TP2：{trade.final_target_price:g}\n"
+                    f"计划持仓：约 {trade.planned_hold_hours:g} 小时"
+                )
+            )
         if not prev.tp1_hit and trade.tp1_hit:
             out.append(
                 (
@@ -656,13 +689,21 @@ async def _scan_market(
     *,
     fixed_symbols: list[str],
     top_volume_limit: int,
+    altcoin_enabled: bool,
     score_threshold: int,
     expected_hold_hours: float,
     min_hold_hours: float,
     max_hold_hours: float,
     dynamic_hold: bool,
     target_rr: float,
+    tp1_r: float,
+    tp2_r: float,
+    final_tp_r: float,
+    partial_close_pct_at_tp1: float,
     expire_minutes: int,
+    max_open_trades: int,
+    max_open_trades_per_side: int,
+    side_cooldown_minutes: int,
     symbol_thresholds: dict[str, int],
     direction_thresholds: dict[tuple[str, str], int],
     dynamic_alt_limit: int,
@@ -684,22 +725,30 @@ async def _scan_market(
     confirm_minutes: int,
     paper_entry_mode: str,
     symbol_cooldown_minutes: int,
+    breakout_confirmation_mode: str,
+    confirmation_candle: str,
+    hold_confirmation_candles: int,
+    pullback_tolerance_r: float,
+    pullback_expire_minutes: int,
     notifier: TelegramNotifier | None,
     send_market_summary: bool = False,
 ) -> None:
-    top_symbols = await fetch_top_usdm_symbols_by_quote_volume(limit=top_volume_limit)
-    dynamic_alt_candidates = await _select_dynamic_alt_candidates(
-        fixed_symbols=fixed_symbols + top_symbols,
-        top_limit=dynamic_alt_top_limit,
-        limit=dynamic_alt_limit,
-        lookback_days=dynamic_alt_lookback_days,
-        min_volume_ratio=dynamic_alt_volume_ratio,
-        min_quote_volume=dynamic_alt_min_quote_volume,
-        min_daily_move_pct=dynamic_alt_min_daily_move_pct,
-        max_daily_move_pct=dynamic_alt_max_daily_move_pct,
-        min_daily_range_pct=dynamic_alt_min_daily_range_pct,
-        max_daily_range_pct=dynamic_alt_max_daily_range_pct,
-    )
+    top_symbols: list[str] = []
+    dynamic_alt_candidates: list[DynamicAltCandidate] = []
+    if altcoin_enabled:
+        top_symbols = await fetch_top_usdm_symbols_by_quote_volume(limit=top_volume_limit)
+        dynamic_alt_candidates = await _select_dynamic_alt_candidates(
+            fixed_symbols=fixed_symbols + top_symbols,
+            top_limit=dynamic_alt_top_limit,
+            limit=dynamic_alt_limit,
+            lookback_days=dynamic_alt_lookback_days,
+            min_volume_ratio=dynamic_alt_volume_ratio,
+            min_quote_volume=dynamic_alt_min_quote_volume,
+            min_daily_move_pct=dynamic_alt_min_daily_move_pct,
+            max_daily_move_pct=dynamic_alt_max_daily_move_pct,
+            min_daily_range_pct=dynamic_alt_min_daily_range_pct,
+            max_daily_range_pct=dynamic_alt_max_daily_range_pct,
+        )
     dynamic_alt_symbols = [candidate.symbol for candidate in dynamic_alt_candidates]
     dynamic_alt_symbol_set = set(dynamic_alt_symbols)
     if dynamic_alt_candidates:
@@ -708,6 +757,9 @@ async def _scan_market(
             "；".join(candidate.format_line() for candidate in dynamic_alt_candidates),
         )
     symbols = _dedupe_symbols(fixed_symbols + top_symbols + dynamic_alt_symbols)
+    if not altcoin_enabled:
+        # Default behavior: only scan main allowlist symbols to avoid correlated duplicates.
+        symbols = _dedupe_symbols(fixed_symbols)
     logger.info("本轮观察池：%s", "，".join(symbols))
     market_candles = None
     market_entry_candles = None
@@ -809,19 +861,53 @@ async def _scan_market(
         if candidate.score >= threshold:
             qualified.append(candidate)
 
+    hard_filter_failed = [
+        c for c in qualified if c.direction in {"做多观察", "做空观察"} and not bool(getattr(c, "hard_filter_passed", False))
+    ]
+    trade_candidates = [c for c in qualified if bool(getattr(c, "hard_filter_passed", False))]
+    trade_candidates_pre_risk = list(trade_candidates)
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    trades = load_paper_trades(paper_path)
+    trade_candidates, skipped_signals = filter_signals(
+        trade_candidates,
+        trades,
+        now_time_ms=now_ms,
+        config=RiskFilterConfig(
+            max_open_trades=max_open_trades,
+            max_open_trades_per_side=max_open_trades_per_side,
+            symbol_cooldown_minutes=symbol_cooldown_minutes,
+            side_cooldown_minutes=side_cooldown_minutes,
+            main_symbol_allowlist=tuple(s.strip().upper() for s in fixed_symbols if s.strip()),
+            altcoin_enabled=altcoin_enabled,
+        ),
+    )
+    if skipped_signals:
+        out = append_skipped_signals("skipped_signals.csv", skipped_signals)
+        logger.info("风险过滤：跳过 %s 条候选信号，已记录：%s", len(skipped_signals), out)
+
     recorded: list[PaperTrade] = []
-    if paper_record and qualified:
+    if paper_record and trade_candidates:
         recorded = record_signal_candidates(
-            qualified,
+            trade_candidates,
             paper_path,
             confirm_minutes=confirm_minutes,
             entry_mode=paper_entry_mode,
             cooldown_minutes=symbol_cooldown_minutes,
+            breakout_confirmation_mode=breakout_confirmation_mode,
+            confirmation_candle=confirmation_candle,
+            hold_confirmation_candles=hold_confirmation_candles,
+            pullback_tolerance_r=pullback_tolerance_r,
+            pullback_expire_minutes=pullback_expire_minutes,
+            tp1_r=tp1_r,
+            tp2_r=tp2_r,
+            final_tp_r=final_tp_r,
+            partial_close_pct_at_tp1=partial_close_pct_at_tp1,
         )
         logger.info(
             "虚拟盘记录：新增 %s 条，重复/冷却跳过 %s 条，账本=%s",
             len(recorded),
-            len(qualified) - len(recorded),
+            len(trade_candidates) - len(recorded),
             paper_path,
         )
 
@@ -836,12 +922,17 @@ async def _scan_market(
         logger.info("本轮无达标候选（score_threshold=%s），不发送通知。", score_threshold)
         return
 
-    trades = load_paper_trades(paper_path) if paper_record else []
+    trades = trades if paper_record else []
     recorded_keys = {(t.symbol, t.direction) for t in recorded}
     entry_messages: list[str] = []
     confirm_messages: list[str] = []
+    failed_messages: list[str] = []
     suppressed = 0
-    for candidate in qualified:
+
+    for candidate in hard_filter_failed:
+        failed_messages.append(candidate.to_telegram_message())
+
+    for candidate in trade_candidates:
         key = (candidate.symbol.strip().upper(), candidate.direction)
         if key in recorded_keys:
             entry_messages.append(candidate.to_telegram_message())
@@ -860,12 +951,17 @@ async def _scan_market(
         f"观察池数量：{len(symbols)}\n"
         f"推送阈值：{score_threshold}\n"
         f"达标备案：{len(qualified)}\n"
+        f"硬过滤通过：{len(trade_candidates_pre_risk)}（风险过滤后 {len(trade_candidates)}）\n"
+        f"硬过滤失败：{len(hard_filter_failed)}\n"
         f"新增开仓通知：{len(entry_messages)}\n"
-        f"增强确认：{len(confirm_messages)}"
+        f"增强确认：{len(confirm_messages)}\n"
+        f"硬过滤失败通知：{len(failed_messages)}"
     )
     for msg in entry_messages:
         await notifier.send_text(msg)
     for msg in confirm_messages:
+        await notifier.send_text(msg)
+    for msg in failed_messages:
         await notifier.send_text(msg)
 
     if suppressed:
@@ -876,13 +972,21 @@ async def _run_live_loop(
     *,
     fixed_symbols: list[str],
     top_volume_limit: int,
+    altcoin_enabled: bool,
     score_threshold: int,
     expected_hold_hours: float,
     min_hold_hours: float,
     max_hold_hours: float,
     dynamic_hold: bool,
     target_rr: float,
+    tp1_r: float,
+    tp2_r: float,
+    final_tp_r: float,
+    partial_close_pct_at_tp1: float,
     expire_minutes: int,
+    max_open_trades: int,
+    max_open_trades_per_side: int,
+    side_cooldown_minutes: int,
     symbol_thresholds: dict[str, int],
     direction_thresholds: dict[tuple[str, str], int],
     dynamic_alt_limit: int,
@@ -915,7 +1019,18 @@ async def _run_live_loop(
     r_trailing_enabled: bool,
     trailing_trigger_pct: float,
     trailing_lock_pct: float,
+    trigger_candle: str,
+    breakout_confirmation_mode: str,
+    hold_confirmation_candles: int,
+    pullback_tolerance_r: float,
+    pullback_expire_minutes: int,
+    cancel_if_stop_before_trigger: bool,
+    move_stop_to_breakeven_after_tp1: bool,
+    max_entry_slippage_r: float,
+    max_trigger_candle_atr_multiple: float,
+    wait_pullback_if_chased: bool,
     notifier: TelegramNotifier | None,
+    notify_triggered_entry: bool,
 ) -> None:
     logger.info("常驻运行已启动：间隔=%s分钟；虚拟盘=%s；导出=%s", loop_minutes, paper_path, paper_export_path)
     snapshot_dir = Path(paper_snapshot_dir)
@@ -936,13 +1051,21 @@ async def _run_live_loop(
             await _scan_market(
                 fixed_symbols=fixed_symbols,
                 top_volume_limit=top_volume_limit,
+                altcoin_enabled=altcoin_enabled,
                 score_threshold=score_threshold,
                 expected_hold_hours=expected_hold_hours,
                 min_hold_hours=min_hold_hours,
                 max_hold_hours=max_hold_hours,
                 dynamic_hold=dynamic_hold,
                 target_rr=target_rr,
+                tp1_r=tp1_r,
+                tp2_r=tp2_r,
+                final_tp_r=final_tp_r,
+                partial_close_pct_at_tp1=partial_close_pct_at_tp1,
                 expire_minutes=expire_minutes,
+                max_open_trades=max_open_trades,
+                max_open_trades_per_side=max_open_trades_per_side,
+                side_cooldown_minutes=side_cooldown_minutes,
                 symbol_thresholds=symbol_thresholds,
                 direction_thresholds=direction_thresholds,
                 dynamic_alt_limit=dynamic_alt_limit,
@@ -964,6 +1087,11 @@ async def _run_live_loop(
                 confirm_minutes=confirm_minutes,
                 paper_entry_mode=paper_entry_mode,
                 symbol_cooldown_minutes=symbol_cooldown_minutes,
+                breakout_confirmation_mode=breakout_confirmation_mode,
+                confirmation_candle=trigger_candle,
+                hold_confirmation_candles=hold_confirmation_candles,
+                pullback_tolerance_r=pullback_tolerance_r,
+                pullback_expire_minutes=pullback_expire_minutes,
                 notifier=notifier,
                 send_market_summary=send_summary,
             )
@@ -990,10 +1118,24 @@ async def _run_live_loop(
                 r_trailing_enabled=r_trailing_enabled,
                 trailing_trigger_pct=trailing_trigger_pct,
                 trailing_lock_pct=trailing_lock_pct,
+                cancel_if_stop_before_trigger=cancel_if_stop_before_trigger,
+                move_stop_to_breakeven_after_tp1=move_stop_to_breakeven_after_tp1,
+                max_entry_slippage_r=max_entry_slippage_r,
+                max_trigger_candle_atr_multiple=max_trigger_candle_atr_multiple,
+                wait_pullback_if_chased=wait_pullback_if_chased,
+                breakout_confirmation_mode=breakout_confirmation_mode,
+                hold_confirmation_candles=hold_confirmation_candles,
+                pullback_tolerance_r=pullback_tolerance_r,
+                pullback_expire_minutes=pullback_expire_minutes,
+                interval=trigger_candle,
             )
             consecutive_network_errors = 0
             if notifier is not None and result.changed_count:
-                for msg in _paper_event_messages(before_trades, result.trades):
+                for msg in _paper_event_messages(
+                    before_trades,
+                    result.trades,
+                    include_triggered_entry=notify_triggered_entry,
+                ):
                     await notifier.send_text(msg)
             now_utc = datetime.now(UTC)
             exported: Path | None = None
@@ -1389,7 +1531,16 @@ async def _backtest(
             target_rr=target_rr,
             confirm_minutes=confirm_minutes,
             expire_minutes=expire_minutes,
+            confirmation_candle=args.trigger_candle,
+            breakout_confirmation_mode=args.breakout_confirmation_mode,
+            hold_confirmation_candles=args.hold_confirmation_candles,
+            pullback_tolerance_r=args.pullback_tolerance_r,
+            pullback_expire_minutes=args.pullback_expire_minutes,
+            cancel_if_stop_before_trigger=args.cancel_if_stop_before_trigger,
             entry_fill_mode=entry_fill_mode,
+            max_entry_slippage_r=args.max_entry_slippage_r,
+            max_trigger_candle_atr_multiple=args.max_trigger_candle_atr_multiple,
+            wait_pullback_if_chased=args.wait_pullback_if_chased,
             min_hold_hours=min_hold_hours,
             max_hold_hours=max_hold_hours,
             dynamic_hold=dynamic_hold,
@@ -1465,6 +1616,16 @@ def main() -> None:
         "--fixed-symbols",
         default="BTCUSDT,ETHUSDT,SOLUSDT",
         help="观察型扫描的固定核心交易对，多个用英文逗号分隔",
+    )
+    parser.add_argument(
+        "--main-symbol-allowlist",
+        default=None,
+        help="主观察标的白名单；默认 BTCUSDT,ETHUSDT,SOLUSDT；不指定时使用 --fixed-symbols",
+    )
+    parser.add_argument(
+        "--altcoin-enabled",
+        action="store_true",
+        help="开启山寨币扫描：允许加入 top-volume 与动态山寨机会池（默认关闭）",
     )
     parser.add_argument(
         "--top-volume-limit",
@@ -1612,6 +1773,43 @@ def main() -> None:
         help="观察型策略目标盈亏比，默认 2.0，即止盈1约为2R",
     )
     parser.add_argument(
+        "--tp1-r",
+        type=float,
+        default=1.0,
+        help="R倍数止盈模型：TP1 = entry ± risk * tp1_r，默认1.0",
+    )
+    parser.add_argument(
+        "--tp2-r",
+        type=float,
+        default=2.0,
+        help="R倍数止盈模型：TP2 = entry ± risk * tp2_r，默认2.0",
+    )
+    parser.add_argument(
+        "--final-tp-r",
+        type=float,
+        default=3.0,
+        help="R倍数止盈模型：Final TP = entry ± risk * final_tp_r，默认3.0",
+    )
+    parser.add_argument(
+        "--partial-close-pct-at-tp1",
+        type=float,
+        default=0.5,
+        help="TP1 命中时分批止盈比例（0-1），默认0.5",
+    )
+    parser.add_argument(
+        "--move-stop-to-breakeven-after-tp1",
+        dest="move_stop_to_breakeven_after_tp1",
+        action="store_true",
+        default=True,
+        help="默认开启：TP1 命中后把剩余仓位止损移动到入场价（保本）；可用 --no-move-stop-to-breakeven-after-tp1 关闭",
+    )
+    parser.add_argument(
+        "--no-move-stop-to-breakeven-after-tp1",
+        dest="move_stop_to_breakeven_after_tp1",
+        action="store_false",
+        help="关闭：TP1 命中后不自动移动止损到保本（仅用于对比测试）",
+    )
+    parser.add_argument(
         "--confirm-minutes",
         type=int,
         default=10,
@@ -1619,9 +1817,92 @@ def main() -> None:
     )
     parser.add_argument(
         "--expire-minutes",
+        "--pending-expire-minutes",
         type=int,
         default=20,
-        help="候选备案过期时间，默认20分钟",
+        help="pending 信号过期时间（超过仍未触发则 expired），默认20分钟",
+    )
+    parser.add_argument(
+        "--trigger-candle",
+        "--confirmation-candle",
+        default="5m",
+        help="突破/触发确认使用的K线周期（会影响触发与虚拟盘同步频率），默认5m",
+    )
+    parser.add_argument(
+        "--breakout-confirmation-mode",
+        choices=["legacy", "close_only", "close_and_hold", "close_and_pullback"],
+        default="close_and_hold",
+        help="breakout 入场确认模式：legacy=触发价触碰即算（旧逻辑A/B）；close_only=收盘价越过即触发；"
+        "close_and_hold=收盘越过后再持稳N根；close_and_pullback=收盘越过后等待回踩再入场；默认 close_and_hold",
+    )
+    parser.add_argument(
+        "--hold-confirmation-candles",
+        type=int,
+        default=1,
+        help="close_and_hold：突破确认后需要额外持稳的 candle 根数（下一根不收回算1根），默认1",
+    )
+    parser.add_argument(
+        "--pullback-tolerance-r",
+        type=float,
+        default=0.25,
+        help="close_and_pullback / no-chase 回踩：允许回踩到 trigger 附近的容差（R倍数），默认0.25",
+    )
+    parser.add_argument(
+        "--pullback-expire-minutes",
+        type=int,
+        default=30,
+        help="等待回踩的超时分钟数（突破确认后开始计时），默认30",
+    )
+    parser.add_argument(
+        "--require-trigger-confirmation",
+        dest="require_trigger_confirmation",
+        action="store_true",
+        default=True,
+        help="默认开启：观察信号先进入 pending，只有触发后才入场（可用 --no-require-trigger-confirmation 关闭做对比）",
+    )
+    parser.add_argument(
+        "--no-require-trigger-confirmation",
+        dest="require_trigger_confirmation",
+        action="store_false",
+        help="关闭触发确认：旧逻辑对比用，信号在 signal_time 按 signal_price 直接入场",
+    )
+    parser.add_argument(
+        "--cancel-if-stop-before-trigger",
+        dest="cancel_if_stop_before_trigger",
+        action="store_true",
+        default=True,
+        help="默认开启：pending 未触发前若先触碰 stop_price，则取消该信号（可用 --no-cancel-if-stop-before-trigger 关闭）",
+    )
+    parser.add_argument(
+        "--no-cancel-if-stop-before-trigger",
+        dest="cancel_if_stop_before_trigger",
+        action="store_false",
+        help="关闭：pending 触发前即使先触碰 stop_price 也不取消（仅用于对比测试）",
+    )
+    parser.add_argument(
+        "--max-entry-slippage-r",
+        type=float,
+        default=0.5,
+        help="no-chase：触发确认K线收盘入场价相对 trigger_price 的最大追单距离（R倍数），默认0.5",
+    )
+    parser.add_argument(
+        "--max-trigger-candle-atr-multiple",
+        type=float,
+        default=1.2,
+        help="no-chase：触发确认K线的实体或振幅超过 ATR 的倍数阈值（超过则不追），默认1.2",
+    )
+    parser.add_argument(
+        "--wait-pullback-if-chased",
+        dest="wait_pullback_if_chased",
+        action="store_true",
+        default=True,
+        help="默认开启：触发后若追单过远/触发K线过大，则进入 wait_pullback 等回踩再入场（可用 --no-wait-pullback-if-chased 关闭）",
+    )
+    parser.add_argument(
+        "--no-wait-pullback-if-chased",
+        dest="wait_pullback_if_chased",
+        action="store_false",
+        help="关闭：追单过远时直接跳过该笔交易（不等待回踩，仅用于对比测试）",
     )
     parser.add_argument(
         "--entry-fill-mode",
@@ -1711,6 +1992,11 @@ def main() -> None:
         help="把测试或扫描结果发送到 Telegram",
     )
     parser.add_argument(
+        "--notify-triggered-entry",
+        action="store_true",
+        help="可选：当 pending 信号满足触发条件并入场后，再额外发送一条“已触发入场”通知（需要 --notify）",
+    )
+    parser.add_argument(
         "--paper-record",
         action="store_true",
         help="扫描达标信号时写入虚拟盘账本；通常与 --scan-market 一起使用",
@@ -1720,6 +2006,24 @@ def main() -> None:
         type=int,
         default=60,
         help="同一币种同方向冷却时间（开/平仓后不再重复记录同方向），默认60分钟；设为0关闭",
+    )
+    parser.add_argument(
+        "--max-open-trades",
+        type=int,
+        default=1,
+        help="同时最多允许的 active 信号/持仓数量（pending/triggered/open），默认1",
+    )
+    parser.add_argument(
+        "--max-open-trades-per-side",
+        type=int,
+        default=1,
+        help="同方向最多允许的 active 信号/持仓数量（pending/triggered/open），默认1",
+    )
+    parser.add_argument(
+        "--side-cooldown-minutes",
+        type=int,
+        default=45,
+        help="同一方向冷却时间（分钟）：在该窗口内不再记录同方向新信号，默认45",
     )
     parser.add_argument(
         "--paper-sync",
@@ -1738,8 +2042,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--paper-entry-mode",
-        default="immediate",
-        help="虚拟盘入场模式：immediate(信号即按当前价入场) 或 confirm(等待站稳触发价)，默认 immediate",
+        default="confirm",
+        help="虚拟盘入场模式：confirm=先记录 pending，触发后入场；immediate=旧逻辑对比用，信号直接入场，默认 confirm",
     )
     parser.add_argument(
         "--paper-export",
@@ -1782,6 +2086,11 @@ def main() -> None:
 
     logger.info("配置加载完成；日志级别=%s", settings.log_level)
     notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+    # CLI compatibility: `--require-trigger-confirmation` forces confirm mode regardless of --paper-entry-mode.
+    # Turning it off is a convenient way to A/B test the legacy "enter at signal_time" behavior.
+    effective_paper_entry_mode = args.paper_entry_mode
+    if not args.require_trigger_confirmation:
+        effective_paper_entry_mode = "immediate"
     symbol_thresholds = _parse_symbol_thresholds(args.symbol_thresholds)
     direction_thresholds = _parse_direction_thresholds(args.direction_thresholds)
 
@@ -1829,18 +2138,26 @@ def main() -> None:
             raise ValueError("--min-hold-hours 与 --max-hold-hours 必须大于0，且最短时间不能大于最长时间")
         if args.relative_rank_limit < 0:
             raise ValueError("--relative-rank-limit 不能小于 0")
-        fixed_symbols = _parse_csv(args.fixed_symbols)
+        fixed_symbols = _parse_csv(args.main_symbol_allowlist) if args.main_symbol_allowlist else _parse_csv(args.fixed_symbols)
         asyncio.run(
             _scan_market(
                 fixed_symbols=fixed_symbols,
                 top_volume_limit=args.top_volume_limit,
+                altcoin_enabled=args.altcoin_enabled,
                 score_threshold=args.score_threshold,
                 expected_hold_hours=args.hold_hours,
                 min_hold_hours=args.min_hold_hours,
                 max_hold_hours=args.max_hold_hours,
                 dynamic_hold=not args.fixed_hold,
                 target_rr=args.target_rr,
+                tp1_r=args.tp1_r,
+                tp2_r=args.tp2_r,
+                final_tp_r=args.final_tp_r,
+                partial_close_pct_at_tp1=args.partial_close_pct_at_tp1,
                 expire_minutes=args.expire_minutes,
+                max_open_trades=args.max_open_trades,
+                max_open_trades_per_side=args.max_open_trades_per_side,
+                side_cooldown_minutes=args.side_cooldown_minutes,
                 symbol_thresholds=symbol_thresholds,
                 direction_thresholds=direction_thresholds,
                 dynamic_alt_limit=args.dynamic_alt_limit,
@@ -1860,8 +2177,13 @@ def main() -> None:
                 paper_record=args.paper_record,
                 paper_path=args.paper_path,
                 confirm_minutes=args.confirm_minutes,
-                paper_entry_mode=args.paper_entry_mode,
+                paper_entry_mode=effective_paper_entry_mode,
                 symbol_cooldown_minutes=args.symbol_cooldown_minutes,
+                breakout_confirmation_mode=args.breakout_confirmation_mode,
+                confirmation_candle=args.trigger_candle,
+                hold_confirmation_candles=args.hold_confirmation_candles,
+                pullback_tolerance_r=args.pullback_tolerance_r,
+                pullback_expire_minutes=args.pullback_expire_minutes,
                 notifier=notifier if args.notify else None,
             )
         )
@@ -1957,6 +2279,16 @@ def main() -> None:
                 r_trailing_enabled=not args.no_r_trailing,
                 trailing_trigger_pct=args.trailing_trigger_pct,
                 trailing_lock_pct=args.trailing_lock_pct,
+                cancel_if_stop_before_trigger=args.cancel_if_stop_before_trigger,
+                move_stop_to_breakeven_after_tp1=args.move_stop_to_breakeven_after_tp1,
+                max_entry_slippage_r=args.max_entry_slippage_r,
+                max_trigger_candle_atr_multiple=args.max_trigger_candle_atr_multiple,
+                wait_pullback_if_chased=args.wait_pullback_if_chased,
+                breakout_confirmation_mode=args.breakout_confirmation_mode,
+                hold_confirmation_candles=args.hold_confirmation_candles,
+                pullback_tolerance_r=args.pullback_tolerance_r,
+                pullback_expire_minutes=args.pullback_expire_minutes,
+                interval=args.trigger_candle,
             )
         )
         report_lines = [f"虚拟盘同步完成：更新 {result.changed_count} 条记录"]
@@ -1984,15 +2316,23 @@ def main() -> None:
         try:
             asyncio.run(
                 _run_live_loop(
-                    fixed_symbols=_parse_csv(args.fixed_symbols),
+                    fixed_symbols=_parse_csv(args.main_symbol_allowlist) if args.main_symbol_allowlist else _parse_csv(args.fixed_symbols),
                     top_volume_limit=args.top_volume_limit,
+                    altcoin_enabled=args.altcoin_enabled,
                     score_threshold=args.score_threshold,
                     expected_hold_hours=args.hold_hours,
                     min_hold_hours=args.min_hold_hours,
                     max_hold_hours=args.max_hold_hours,
                     dynamic_hold=not args.fixed_hold,
                     target_rr=args.target_rr,
+                    tp1_r=args.tp1_r,
+                    tp2_r=args.tp2_r,
+                    final_tp_r=args.final_tp_r,
+                    partial_close_pct_at_tp1=args.partial_close_pct_at_tp1,
                     expire_minutes=args.expire_minutes,
+                    max_open_trades=args.max_open_trades,
+                    max_open_trades_per_side=args.max_open_trades_per_side,
+                    side_cooldown_minutes=args.side_cooldown_minutes,
                     symbol_thresholds=symbol_thresholds,
                     direction_thresholds=direction_thresholds,
                     dynamic_alt_limit=args.dynamic_alt_limit,
@@ -2010,7 +2350,7 @@ def main() -> None:
                     relative_rank_limit=args.relative_rank_limit,
                     weekly_filter=not args.no_weekly_filter,
                     paper_path=args.paper_path,
-                    paper_entry_mode=args.paper_entry_mode,
+                    paper_entry_mode=effective_paper_entry_mode,
                     confirm_minutes=args.confirm_minutes,
                     paper_export_path=args.paper_export,
                     paper_export_every_hours=args.paper_export_every_hours,
@@ -2025,7 +2365,18 @@ def main() -> None:
                     r_trailing_enabled=not args.no_r_trailing,
                     trailing_trigger_pct=args.trailing_trigger_pct,
                     trailing_lock_pct=args.trailing_lock_pct,
+                    trigger_candle=args.trigger_candle,
+                    breakout_confirmation_mode=args.breakout_confirmation_mode,
+                    hold_confirmation_candles=args.hold_confirmation_candles,
+                    pullback_tolerance_r=args.pullback_tolerance_r,
+                    pullback_expire_minutes=args.pullback_expire_minutes,
+                    cancel_if_stop_before_trigger=args.cancel_if_stop_before_trigger,
+                    move_stop_to_breakeven_after_tp1=args.move_stop_to_breakeven_after_tp1,
+                    max_entry_slippage_r=args.max_entry_slippage_r,
+                    max_trigger_candle_atr_multiple=args.max_trigger_candle_atr_multiple,
+                    wait_pullback_if_chased=args.wait_pullback_if_chased,
                     notifier=notifier if args.notify else None,
+                    notify_triggered_entry=args.notify_triggered_entry,
                 )
             )
         except KeyboardInterrupt:

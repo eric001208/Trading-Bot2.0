@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from crypto_signal_bot.indicators import closes, ema, ema_slope, ma25, ma99, volume_ma
 from crypto_signal_bot.models import Candle
+from crypto_signal_bot.strategies.market_regime import MarketRegimeResult, detect_market_regime
 
 MIN_TREND_BARS = 120
 MIN_ENTRY_BARS = 120
@@ -73,6 +75,18 @@ class ObservationCandidate:
     expires_after_minutes: int
     expected_hold_hours: float
     reasons: tuple[str, ...]
+    # New scoring + hard filters (hard filters gate paper-trade entry; soft score only ranks).
+    legacy_score: int = 0
+    hard_filter_passed: bool = False
+    failed_hard_filters: tuple[str, ...] = ()
+    raw_score: float = 0.0
+    final_score: int = 0
+    score_components_json: str = ""
+    # Market regime filter (independent of score; used for trade gating)
+    market_regime: str = "unknown"
+    market_regime_confidence: int = 0
+    no_trade_zone: bool = False
+    market_regime_reasons: tuple[str, ...] = ()
 
     @property
     def signal_grade(self) -> str:
@@ -103,10 +117,20 @@ class ObservationCandidate:
         reason_text = "\n".join(f"{i}. {r}" for i, r in enumerate(self.reasons, start=1))
         checklist_text = "\n".join(f"{i}. {r}" for i, r in enumerate(_manual_confirmation_checklist(self), start=1))
         followup_text = "\n".join(f"{i}. {r}" for i, r in enumerate(_post_trigger_confirmation_plan(self), start=1))
+        header = "观察信号"
+        hard_line = ""
+        if self.direction in {"做多观察", "做空观察"}:
+            if self.hard_filter_passed:
+                header = "硬过滤通过，等待触发"
+                hard_line = "硬过滤：通过（已进入 pending，等待触发确认后入场）\n"
+            elif self.failed_hard_filters:
+                header = "硬过滤失败，仅记录，不交易"
+                hard_line = f"硬过滤：失败（{', '.join(self.failed_hard_filters)}）\n"
         return (
-            f"交易观察备案：{self.symbol} {self.direction}\n\n"
+            f"{header}：{self.symbol} {self.direction}\n\n"
             f"信号级别：{self.level} / {self.signal_grade}\n"
-            f"综合评分：{self.score} / 100\n"
+            f"综合评分：{self.score} / 100（legacy={self.legacy_score}）\n"
+            f"{hard_line}"
             f"处理建议：{self.action_hint}\n"
             f"当前价格：{self.current_price:g}\n"
             f"触发条件：未来短时间内有效站稳 {self.trigger_price:g}\n"
@@ -769,7 +793,7 @@ def _empty_candidate(
     )
 
 
-def _score_candidate_direction(
+def _legacy_score_candidate_direction(
     *,
     direction: str,
     trend_candles: Sequence[Candle],
@@ -1084,6 +1108,514 @@ def _score_candidate_direction(
     )
 
 
+def _soft_score_and_hard_filters(
+    *,
+    legacy: ObservationCandidate,
+    trend_candles: Sequence[Candle],
+    entry_candles: Sequence[Candle],
+    expected_hold_hours: float,
+    min_hold_hours: float,
+    max_hold_hours: float,
+    dynamic_hold: bool,
+    weekly_filter: bool,
+    hard_volume_filter: bool,
+    hard_short_trend_filter: bool,
+    market_regime: MarketRegimeResult | None = None,
+    market_candles: Sequence[Candle] | None = None,
+    market_entry_candles: Sequence[Candle] | None = None,
+) -> ObservationCandidate:
+    """
+    Convert the legacy candidate into:
+      - hard filters (gate paper-trade entry)
+      - soft score (ranking only)
+    """
+    direction = legacy.direction
+    is_long = direction == "做多观察"
+    symbol = legacy.symbol.strip().upper()
+    entry_last = entry_candles[-1]
+
+    # Indicators (optional/defensive: do NOT fabricate if unavailable).
+    trend_ma25 = ma25(trend_candles)
+    trend_ma99 = ma99(trend_candles)
+    entry_ma25 = ma25(entry_candles)
+    entry_ma99 = ma99(entry_candles)
+    vma = volume_ma(entry_candles, 20)
+    atr = _avg_true_range(entry_candles, 14)
+    rsi = _rsi(entry_candles, 14)
+    adx = _adx(entry_candles, 14)
+    trend_rsi = _rsi(trend_candles, 14)
+    er = _efficiency_ratio(trend_candles, TREND_EFFICIENCY_LOOKBACK_BARS)
+    move_6h = _directional_pct_change(trend_candles, 6, direction)
+
+    regime = market_regime or detect_market_regime(trend_candles=trend_candles, entry_candles=entry_candles)
+
+    hard_status: dict[str, str] = {}
+    hard_detail: dict[str, str] = {}
+    failed: list[str] = []
+    unavailable: list[str] = []
+
+    def _append_detail(name: str, detail: str) -> None:
+        if not detail:
+            return
+        prev = hard_detail.get(name, "")
+        hard_detail[name] = f"{prev}；{detail}" if prev else detail
+
+    def _pass(name: str, detail: str) -> None:
+        if hard_status.get(name) == "fail":
+            return
+        hard_status[name] = "pass"
+        _append_detail(name, detail)
+
+    def _fail(name: str, detail: str) -> None:
+        hard_status[name] = "fail"
+        _append_detail(name, detail)
+        failed.append(name)
+
+    def _unavailable(name: str, detail: str) -> None:
+        if name in hard_status:
+            return
+        hard_status[name] = "unavailable"
+        hard_detail[name] = detail
+        unavailable.append(name)
+
+    # --- hard filters ---
+    # Market regime filter (stateful filter beyond pure indicator thresholds)
+    if regime.regime == "unknown":
+        _fail("not_in_chop_zone", "市场状态=unknown（数据不足/状态不明），保守起见不允许交易。")
+    if regime.no_trade_zone:
+        _fail("not_in_chop_zone", "no_trade_zone=true（价格在区间中部40%-60%），不允许交易。")
+    if regime.regime == "range":
+        _fail("not_in_chop_zone", "市场状态=range（震荡市），不允许 breakout 直接开单。")
+    # compression: allowed, but must wait for trigger confirmation (paper default confirm mode).
+
+    # 1) higher_timeframe_trend_aligned
+    if trend_ma25 is None or trend_ma99 is None:
+        _unavailable("higher_timeframe_trend_aligned", "1h MA25/MA99 未就绪")
+    else:
+        slope = _ma25_slope(trend_candles)
+        ma_alignment = trend_ma25 >= trend_ma99 if is_long else trend_ma25 <= trend_ma99
+        price_ok = trend_candles[-1].close >= trend_ma99 if is_long else trend_candles[-1].close <= trend_ma99
+        slope_ok = slope >= 0 if is_long else slope <= 0
+        ok = ma_alignment and price_ok and slope_ok
+        _pass(
+            "higher_timeframe_trend_aligned",
+            f"1h结构：MA25={trend_ma25:.4g} MA99={trend_ma99:.4g} slope={slope:.4g} close={trend_candles[-1].close:g}",
+        ) if ok else _fail(
+            "higher_timeframe_trend_aligned",
+            f"1h结构不一致：MA25={trend_ma25:.4g} MA99={trend_ma99:.4g} slope={slope:.4g} close={trend_candles[-1].close:g}",
+        )
+
+    if weekly_filter:
+        weekly = classify_weekly_trend(trend_candles)
+        if is_long and not weekly.allows_long:
+            _fail("higher_timeframe_trend_aligned", f"单币周趋势过滤：{weekly.detail}")
+        elif (not is_long) and not weekly.allows_short:
+            _fail("higher_timeframe_trend_aligned", f"单币周趋势过滤：{weekly.detail}")
+
+    # 15m结构（触发价附近）+（非BTC时）BTC同向结构
+    if hard_short_trend_filter:
+        ok_ema, ema_detail = _short_term_trend_ok(entry_candles, direction, reference_price=legacy.trigger_price)
+        if not ok_ema:
+            _fail("higher_timeframe_trend_aligned", f"15m EMA结构不一致：{ema_detail}")
+
+        if symbol != "BTCUSDT":
+            if market_entry_candles is None:
+                _unavailable("higher_timeframe_trend_aligned", "BTC 15m K线缺失，无法校验BTC同向结构")
+            else:
+                btc_ok, btc_detail = _short_term_trend_ok(market_entry_candles, direction)
+                if not btc_ok:
+                    _fail("higher_timeframe_trend_aligned", f"BTC 15m同向结构不一致：{btc_detail}")
+    else:
+        _unavailable("higher_timeframe_trend_aligned", "短周期EMA结构过滤已关闭")
+
+    # BTC整体周趋势/环境过滤（非BTC时）
+    if symbol != "BTCUSDT" and market_candles is not None:
+        market_weekly = classify_weekly_trend(market_candles)
+        if is_long and not market_weekly.allows_long:
+            _fail("higher_timeframe_trend_aligned", f"BTC周趋势过滤：{market_weekly.detail}")
+        elif (not is_long) and not market_weekly.allows_short:
+            _fail("higher_timeframe_trend_aligned", f"BTC周趋势过滤：{market_weekly.detail}")
+        regime = classify_market_regime(market_candles)
+        if is_long and not regime.allows_long:
+            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{regime.detail}")
+        elif (not is_long) and not regime.allows_short:
+            _fail("higher_timeframe_trend_aligned", f"大盘过滤：{regime.detail}")
+
+    # 2) not_in_chop_zone
+    # Note: we intentionally keep this independent of score; if some data is missing, mark unavailable.
+    if adx is None:
+        _unavailable("not_in_chop_zone", "15m ADX 未就绪")
+    elif adx < 12:
+        _fail("not_in_chop_zone", f"15m ADX过低：ADX={adx:.1f}（<12，偏震荡）")
+    else:
+        _pass("not_in_chop_zone", f"15m ADX={adx:.1f}")
+    if er is None:
+        _unavailable("not_in_chop_zone", "1h ER 未就绪")
+    elif abs(er) < MIN_TREND_EFFICIENCY_ABS:
+        _fail("not_in_chop_zone", f"1h ER过低：ER={er:.3f}（|ER|<{MIN_TREND_EFFICIENCY_ABS}，偏无趋势）")
+    else:
+        # Only mark pass if not already failed by previous checks.
+        if hard_status.get("not_in_chop_zone") != "fail":
+            _pass("not_in_chop_zone", f"1h ER={er:.3f}")
+
+    if hard_volume_filter:
+        vol_ok, vol_detail = _volume_spike_ok(entry_candles)
+        if not vol_ok:
+            _fail("not_in_chop_zone", f"成交量过滤：{vol_detail}")
+        else:
+            if hard_status.get("not_in_chop_zone") != "fail":
+                _pass("not_in_chop_zone", f"成交量通过：{vol_detail}")
+    else:
+        _unavailable("not_in_chop_zone", "成交量过滤已关闭")
+
+    # 3) trigger_price_valid
+    if legacy.trigger_price <= 0 or legacy.current_price <= 0:
+        _fail("trigger_price_valid", "价格非法")
+    else:
+        if is_long and legacy.trigger_price <= legacy.current_price:
+            _fail("trigger_price_valid", f"做多触发价需高于现价：trigger={legacy.trigger_price:g} <= now={legacy.current_price:g}")
+        elif (not is_long) and legacy.trigger_price >= legacy.current_price:
+            _fail("trigger_price_valid", f"做空触发价需低于现价：trigger={legacy.trigger_price:g} >= now={legacy.current_price:g}")
+        else:
+            gap = abs(legacy.trigger_price - legacy.current_price) / legacy.current_price
+            if gap < 0.0004:
+                _fail("trigger_price_valid", f"触发价过近：gap={gap*100:.3f}%（<0.04%）")
+            elif gap > 0.012:
+                _fail("trigger_price_valid", f"触发价过远：gap={gap*100:.3f}%（>1.2%）")
+            else:
+                _pass("trigger_price_valid", f"gap={gap*100:.3f}%")
+
+    # 4) stop_distance_reasonable
+    if legacy.trigger_price <= 0:
+        _fail("stop_distance_reasonable", "触发价非法")
+    else:
+        risk_pct = abs(legacy.trigger_price - legacy.stop_loss) / legacy.trigger_price
+        if is_long and legacy.stop_loss >= legacy.trigger_price:
+            _fail("stop_distance_reasonable", f"做多止损需低于触发价：stop={legacy.stop_loss:g} trigger={legacy.trigger_price:g}")
+        elif (not is_long) and legacy.stop_loss <= legacy.trigger_price:
+            _fail("stop_distance_reasonable", f"做空止损需高于触发价：stop={legacy.stop_loss:g} trigger={legacy.trigger_price:g}")
+        elif risk_pct < 0.0025:
+            _fail("stop_distance_reasonable", f"止损过紧：risk={risk_pct*100:.3f}%（<0.25%）")
+        elif risk_pct > 0.022:
+            _fail("stop_distance_reasonable", f"止损过宽：risk={risk_pct*100:.3f}%（>2.2%）")
+        else:
+            _pass("stop_distance_reasonable", f"risk={risk_pct*100:.3f}%")
+
+    # 5) tp1_reachable_by_atr
+    if atr is None or atr <= 0:
+        _unavailable("tp1_reachable_by_atr", "ATR 未就绪")
+    else:
+        risk = abs(legacy.trigger_price - legacy.stop_loss)
+        if risk <= 0:
+            _fail("tp1_reachable_by_atr", "risk<=0")
+        else:
+            if expected_hold_hours <= 1.5:
+                max_ratio = 1.8
+            elif expected_hold_hours <= 2.5:
+                max_ratio = 2.2
+            else:
+                max_ratio = 2.6
+            ratio = risk / atr
+            if ratio > max_ratio:
+                _fail("tp1_reachable_by_atr", f"risk/ATR={ratio:.2f}（>{max_ratio:.2f}，TP1=1R可能偏远）")
+            else:
+                _pass("tp1_reachable_by_atr", f"risk/ATR={ratio:.2f}（<= {max_ratio:.2f}）")
+
+    # 6) spread_or_liquidity_ok (optional)
+    _unavailable("spread_or_liquidity_ok", "暂无盘口/点差数据源，未启用该过滤")
+
+    # --- soft score (ranking only) ---
+    # Soft score must NOT bypass hard filters; it only ranks candidates that already pass.
+    trend_score = 0.0
+    momentum_score = 0.0
+    volume_score = 0.0
+    risk_score = 0.0
+    btc_env_score = 0.0
+    hold_score = 0.0
+
+    if trend_ma25 is not None and trend_ma99 is not None:
+        ma_alignment = trend_ma25 >= trend_ma99 if is_long else trend_ma25 <= trend_ma99
+        trend_score += 10.0 if ma_alignment else 0.0
+        price_ok = trend_candles[-1].close >= trend_ma99 if is_long else trend_candles[-1].close <= trend_ma99
+        trend_score += 8.0 if price_ok else 0.0
+        slope = _ma25_slope(trend_candles)
+        slope_ok = slope >= 0 if is_long else slope <= 0
+        trend_score += 6.0 if slope_ok else 0.0
+    if trend_rsi is not None:
+        if is_long and trend_rsi >= 52:
+            trend_score += 3.0
+        elif (not is_long) and trend_rsi <= 48:
+            trend_score += 3.0
+
+    # Momentum (15m)
+    if move_6h is not None:
+        if move_6h >= 0.003:
+            momentum_score += 6.0
+        elif move_6h >= 0.001:
+            momentum_score += 3.0
+        elif move_6h <= -0.001:
+            momentum_score -= 3.0
+    if adx is not None:
+        if adx >= 22:
+            momentum_score += 6.0
+        elif adx >= 18:
+            momentum_score += 5.0
+        elif adx >= 14:
+            momentum_score += 3.0
+        elif adx >= 12:
+            momentum_score += 1.0
+        else:
+            momentum_score -= 2.0
+    if rsi is not None:
+        if is_long:
+            if 45 <= rsi <= 65:
+                momentum_score += 5.0
+            elif 65 < rsi <= 72:
+                momentum_score += 2.0
+            elif rsi < 40 or rsi > 75:
+                momentum_score -= 1.5
+        else:
+            if 35 <= rsi <= 55:
+                momentum_score += 5.0
+            elif 28 <= rsi < 35:
+                momentum_score += 2.0
+            elif rsi < 25 or rsi > 60:
+                momentum_score -= 1.5
+
+    if entry_ma25 is not None and entry_ma99 is not None:
+        recent = entry_candles[-ENTRY_RANGE_LOOKBACK_BARS:]
+        recent_high = max(c.high for c in recent)
+        recent_low = min(c.low for c in recent)
+        pulled_back = (
+            (recent_low <= entry_ma25 * 1.004 or recent_low <= entry_ma99 * 1.01)
+            if is_long
+            else (recent_high >= entry_ma25 * 0.996 or recent_high >= entry_ma99 * 0.99)
+        )
+        momentum_score += 5.0 if pulled_back else 0.0
+
+        # Trigger gap as quality proxy.
+        if legacy.current_price > 0:
+            trigger_gap = abs(legacy.trigger_price - legacy.current_price) / legacy.current_price
+            if trigger_gap <= 0.006:
+                momentum_score += 2.0
+            elif trigger_gap <= 0.012:
+                momentum_score += 1.0
+
+    # Volume
+    if vma is not None and vma > 0:
+        multiple = entry_last.volume / vma
+        if multiple >= 1.6:
+            volume_score += 15.0
+        elif multiple >= 1.3:
+            volume_score += 12.0
+        elif multiple >= 1.1:
+            volume_score += 8.0
+        elif multiple >= 0.9:
+            volume_score += 5.0
+
+    # Risk (stop distance + position)
+    if legacy.trigger_price > 0:
+        risk_pct = abs(legacy.trigger_price - legacy.stop_loss) / legacy.trigger_price
+        if 0.0025 <= risk_pct <= 0.012:
+            risk_score += 12.0
+        elif risk_pct <= 0.018:
+            risk_score += 8.0
+        elif risk_pct <= 0.022:
+            risk_score += 5.0
+        else:
+            risk_score += 0.0
+    pos = _position_context(
+        direction=direction,
+        trend_candles=trend_candles,
+        trigger_price=legacy.trigger_price,
+        stop_loss=legacy.stop_loss,
+    )
+    if pos.score_adjustment >= 0:
+        risk_score += 4.0
+
+    # BTC environment (optional)
+    if symbol != "BTCUSDT" and market_candles is not None:
+        btc_env_score += 2.0
+        sym_ret = _pct_change(trend_candles, 6)
+        btc_ret = _pct_change(market_candles, 6)
+        if sym_ret is not None and btc_ret is not None:
+            rel = sym_ret - btc_ret
+            if is_long and rel >= 0.002:
+                btc_env_score += 4.0
+            elif (not is_long) and rel <= -0.002:
+                btc_env_score += 4.0
+        regime = classify_market_regime(market_candles)
+        if (is_long and regime.direction == "偏强") or ((not is_long) and regime.direction == "偏弱"):
+            btc_env_score += 4.0
+
+    # Hold-time plan as "stage/strength" quality
+    hold_plan = estimate_hold_time_plan(
+        direction=direction,
+        trend_candles=trend_candles,
+        entry_candles=entry_candles,
+        base_hold_hours=expected_hold_hours,
+        min_hold_hours=min_hold_hours,
+        max_hold_hours=max_hold_hours,
+        dynamic_hold=dynamic_hold,
+    )
+    if hold_plan.stage == "趋势初段":
+        hold_score += 3.0
+    elif hold_plan.stage == "趋势中段":
+        hold_score += 1.5
+    elif hold_plan.stage == "趋势末段/过热":
+        hold_score -= 4.0
+    elif hold_plan.stage == "趋势未确认":
+        hold_score -= 2.0
+    if hold_plan.strength == "强":
+        hold_score += 2.0
+    elif hold_plan.strength == "弱":
+        hold_score -= 1.0
+
+    # Clamp component ranges to keep score distribution sane.
+    trend_score = max(0.0, min(30.0, trend_score))
+    momentum_score = max(0.0, min(25.0, momentum_score))
+    volume_score = max(0.0, min(15.0, volume_score))
+    risk_score = max(0.0, min(20.0, risk_score))
+    btc_env_score = max(0.0, min(10.0, btc_env_score))
+    hold_score = max(-5.0, min(5.0, hold_score))
+
+    raw_score = trend_score + momentum_score + volume_score + risk_score + btc_env_score + hold_score
+    # Light up the midrange a bit to keep practical thresholds (e.g. 70/80/90) meaningful,
+    # without letting everything saturate at 99/100 again.
+    final_score = _clamp_score(raw_score * 1.10)
+
+    # Deduplicate failed filter keys while keeping insertion order.
+    if failed:
+        seen: set[str] = set()
+        failed = [name for name in failed if not (name in seen or seen.add(name))]
+    hard_passed = len(failed) == 0
+    # If some filters are unavailable, they do NOT block entry yet; we only log them.
+    components = {
+        "market_regime": {
+            "regime": regime.regime,
+            "confidence": int(regime.confidence),
+            "no_trade_zone": bool(regime.no_trade_zone),
+            "reasons": list(regime.reasons),
+        },
+        "soft_score": {
+            "trend": round(trend_score, 6),
+            "momentum": round(momentum_score, 6),
+            "volume": round(volume_score, 6),
+            "risk": round(risk_score, 6),
+            "btc_env": round(btc_env_score, 6),
+            "hold_time": round(hold_score, 6),
+        },
+        "hard_filters": {
+            name: {
+                "status": hard_status.get(name, "unavailable"),
+                "detail": hard_detail.get(name, ""),
+            }
+            for name in (
+                "higher_timeframe_trend_aligned",
+                "not_in_chop_zone",
+                "trigger_price_valid",
+                "stop_distance_reasonable",
+                "tp1_reachable_by_atr",
+                "spread_or_liquidity_ok",
+            )
+        },
+        "unavailable_hard_filters": unavailable,
+        "indicators": {
+            "adx_15m": round(float(adx), 6) if adx is not None else None,
+            "atr_15m": round(float(atr), 8) if atr is not None else None,
+            "er_1h": round(float(er), 6) if er is not None else None,
+            "rsi_15m": round(float(rsi), 6) if rsi is not None else None,
+            "vma_20": round(float(vma), 6) if vma is not None else None,
+        },
+    }
+    components_json = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
+
+    legacy_reasons: list[str] = []
+    for r in legacy.reasons:
+        if r.startswith("评分拆分："):
+            legacy_reasons.append(r.replace("评分拆分：", "legacy评分拆分：", 1))
+        else:
+            legacy_reasons.append(r)
+    regime_line = (
+        f"市场状态：{regime.regime}（confidence={int(regime.confidence)}/100，no_trade_zone={bool(regime.no_trade_zone)}）"
+    )
+    hard_line = (
+        f"硬过滤：{'通过' if hard_passed else '失败'}；failed={','.join(failed) if failed else '-'}；"
+        f"unavailable={','.join(unavailable) if unavailable else '-'}"
+    )
+    soft_line = (
+        "soft评分拆分："
+        f"trend={trend_score:.0f} momentum={momentum_score:.0f} volume={volume_score:.0f} risk={risk_score:.0f} "
+        f"btc={btc_env_score:.0f} hold={hold_score:.0f} raw={raw_score:.1f} -> final={final_score}/100"
+    )
+
+    return replace(
+        legacy,
+        score=final_score,
+        level=_level(final_score),
+        legacy_score=int(legacy.score),
+        hard_filter_passed=hard_passed,
+        failed_hard_filters=tuple(failed),
+        raw_score=float(raw_score),
+        final_score=int(final_score),
+        score_components_json=components_json,
+        market_regime=str(regime.regime),
+        market_regime_confidence=int(regime.confidence),
+        no_trade_zone=bool(regime.no_trade_zone),
+        market_regime_reasons=tuple(regime.reasons),
+        reasons=tuple(legacy_reasons + [regime_line, hard_line, soft_line]),
+        # Keep hold plan hours from legacy candidate (already dynamic); don't overwrite.
+    )
+
+
+def _score_candidate_direction(
+    *,
+    direction: str,
+    trend_candles: Sequence[Candle],
+    entry_candles: Sequence[Candle],
+    expected_hold_hours: float,
+    min_hold_hours: float,
+    max_hold_hours: float,
+    dynamic_hold: bool,
+    symbol: str,
+    target_rr: float,
+    expires_after_minutes: int,
+    weekly_filter: bool = True,
+    hard_volume_filter: bool = True,
+    hard_short_trend_filter: bool = True,
+    market_regime: MarketRegimeResult | None = None,
+    market_candles: Sequence[Candle] | None = None,
+    market_entry_candles: Sequence[Candle] | None = None,
+) -> ObservationCandidate:
+    legacy = _legacy_score_candidate_direction(
+        direction=direction,
+        trend_candles=trend_candles,
+        entry_candles=entry_candles,
+        expected_hold_hours=expected_hold_hours,
+        min_hold_hours=min_hold_hours,
+        max_hold_hours=max_hold_hours,
+        dynamic_hold=dynamic_hold,
+        symbol=symbol,
+        target_rr=target_rr,
+        expires_after_minutes=expires_after_minutes,
+    )
+    return _soft_score_and_hard_filters(
+        legacy=legacy,
+        trend_candles=trend_candles,
+        entry_candles=entry_candles,
+        expected_hold_hours=expected_hold_hours,
+        min_hold_hours=min_hold_hours,
+        max_hold_hours=max_hold_hours,
+        dynamic_hold=dynamic_hold,
+        weekly_filter=weekly_filter,
+        hard_volume_filter=hard_volume_filter,
+        hard_short_trend_filter=hard_short_trend_filter,
+        market_regime=market_regime,
+        market_candles=market_candles,
+        market_entry_candles=market_entry_candles,
+    )
+
+
 def evaluate_observation_candidate(
     *,
     symbol: str,
@@ -1114,6 +1646,37 @@ def evaluate_observation_candidate(
         )
 
     symbol = symbol.strip().upper()
+    regime = detect_market_regime(trend_candles=trend_candles, entry_candles=entry_candles)
+
+    def _mark_chop(candidate: ObservationCandidate, gap: int) -> ObservationCandidate:
+        # Hard filter: not_in_chop_zone. Do not let score override this.
+        failed = list(candidate.failed_hard_filters)
+        if "not_in_chop_zone" not in failed:
+            failed.append("not_in_chop_zone")
+        components_json = candidate.score_components_json
+        try:
+            payload = json.loads(components_json) if components_json else {}
+            hard = payload.get("hard_filters", {})
+            item = hard.get("not_in_chop_zone", {"status": "unavailable", "detail": ""})
+            item["status"] = "fail"
+            extra = f"方向置信度过低：多空评分差距仅 {gap} 分（阈值 {MIN_DIRECTION_SCORE_GAP}）"
+            if item.get("detail"):
+                item["detail"] = f"{item['detail']}；{extra}"
+            else:
+                item["detail"] = extra
+            hard["not_in_chop_zone"] = item
+            payload["hard_filters"] = hard
+            components_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            # Defensive: do not fail the strategy if JSON formatting breaks.
+            components_json = candidate.score_components_json
+        return replace(
+            candidate,
+            hard_filter_passed=False,
+            failed_hard_filters=tuple(failed),
+            score_components_json=components_json,
+        )
+
     long_candidate = _score_candidate_direction(
         direction="做多观察",
         trend_candles=trend_candles,
@@ -1125,6 +1688,12 @@ def evaluate_observation_candidate(
         symbol=symbol,
         target_rr=target_rr,
         expires_after_minutes=expires_after_minutes,
+        weekly_filter=weekly_filter,
+        hard_volume_filter=hard_volume_filter,
+        hard_short_trend_filter=hard_short_trend_filter,
+        market_regime=regime,
+        market_candles=None if symbol == "BTCUSDT" else market_candles,
+        market_entry_candles=None if symbol == "BTCUSDT" else market_entry_candles,
     )
     short_candidate = _score_candidate_direction(
         direction="做空观察",
@@ -1137,155 +1706,30 @@ def evaluate_observation_candidate(
         symbol=symbol,
         target_rr=target_rr,
         expires_after_minutes=expires_after_minutes,
+        weekly_filter=weekly_filter,
+        hard_volume_filter=hard_volume_filter,
+        hard_short_trend_filter=hard_short_trend_filter,
+        market_regime=regime,
+        market_candles=None if symbol == "BTCUSDT" else market_candles,
+        market_entry_candles=None if symbol == "BTCUSDT" else market_entry_candles,
     )
-    candidate = long_candidate if long_candidate.score >= short_candidate.score else short_candidate
 
     # If both directions score similarly, it's usually a noisy / mean-reverting state.
     # Skip these to improve directional accuracy and avoid alert spam in chop.
     if long_candidate.direction in {"做多观察", "做空观察"} and short_candidate.direction in {"做多观察", "做空观察"}:
         gap = abs(long_candidate.score - short_candidate.score)
         if gap < MIN_DIRECTION_SCORE_GAP:
-            winner = long_candidate if long_candidate.score >= short_candidate.score else short_candidate
-            return replace(
-                winner,
-                score=min(winner.score, 64),
-                level="暂不关注",
-                reasons=winner.reasons + (f"方向置信度过滤：多空评分差距仅 {gap} 分（阈值 {MIN_DIRECTION_SCORE_GAP}），方向不明确，本轮只记录。",),
-            )
+            long_candidate = _mark_chop(long_candidate, gap)
+            short_candidate = _mark_chop(short_candidate, gap)
 
-    if hard_volume_filter and candidate.direction in {"做多观察", "做空观察"}:
-        ok, detail = _volume_spike_ok(entry_candles)
-        if not ok:
-            return replace(
-                candidate,
-                score=min(candidate.score, 59),
-                level="暂不关注",
-                reasons=candidate.reasons + (f"成交量过滤：{detail}，不满足放量要求，本轮作废。",),
-            )
-
-    if hard_short_trend_filter and candidate.direction in {"做多观察", "做空观察"}:
-        ok, detail = _short_term_trend_ok(
-            entry_candles,
-            candidate.direction,
-            reference_price=candidate.trigger_price,
-        )
-        if not ok:
-            return replace(
-                candidate,
-                score=min(candidate.score, 59),
-                level="暂不关注",
-                reasons=candidate.reasons + (f"短周期趋势过滤：{detail}，15m EMA结构与方向不一致，本轮作废。",),
-            )
-        if symbol != "BTCUSDT" and market_entry_candles is not None:
-            btc_ok, btc_detail = _short_term_trend_ok(market_entry_candles, candidate.direction)
-            if not btc_ok:
-                return replace(
-                    candidate,
-                    score=min(candidate.score, 59),
-                    level="暂不关注",
-                    reasons=candidate.reasons + (f"BTC短周期趋势过滤：{btc_detail}，BTC与本单方向不一致，本轮作废。",),
-                )
-
-    if weekly_filter and candidate.direction in {"做多观察", "做空观察"}:
-        weekly = classify_weekly_trend(trend_candles)
-        candidate = _apply_long_context_filter(candidate, weekly, label="单币1-2周趋势")
-        if candidate.level == "暂不关注":
-            return candidate
-
-    if market_candles is None or symbol == "BTCUSDT" or candidate.direction not in {"做多观察", "做空观察"}:
-        return candidate
-
-    market_trend = classify_weekly_trend(market_candles)
-    candidate = _apply_long_context_filter(candidate, market_trend, label="BTC整体1-2周趋势")
-    if candidate.level == "暂不关注":
-        return candidate
-
-    regime = classify_market_regime(market_candles)
-    symbol_return = _pct_change(trend_candles, 6)
-    btc_return = _pct_change(market_candles, 6)
-    symbol_return_24h = _pct_change(trend_candles, 24)
-    btc_return_24h = _pct_change(market_candles, 24)
-    relative_reasons: tuple[str, ...] = ()
-    if symbol_return is not None and btc_return is not None:
-        relative = symbol_return - btc_return
-        if candidate.direction == "做多观察" and relative < -0.003:
-            return replace(
-                candidate,
-                score=min(candidate.score, 64),
-                level="暂不关注",
-                reasons=candidate.reasons
-                + (
-                    f"相对强弱过滤：近6小时本币相对 BTC 落后 {abs(relative) * 100:.2f}%，做多备案作废。",
-                ),
-            )
-        if candidate.direction == "做空观察" and relative > 0.003:
-            return replace(
-                candidate,
-                score=min(candidate.score, 64),
-                level="暂不关注",
-                reasons=candidate.reasons
-                + (
-                    f"相对强弱过滤：近6小时本币相对 BTC 更强 {relative * 100:.2f}%，做空备案作废。",
-                ),
-            )
-        if candidate.direction == "做多观察" and relative > 0.002:
-            relative_reasons = (f"相对强弱通过：近6小时本币强于 BTC {relative * 100:.2f}%。",)
-        elif candidate.direction == "做空观察" and relative < -0.002:
-            relative_reasons = (f"相对强弱通过：近6小时本币弱于 BTC {abs(relative) * 100:.2f}%。",)
-        else:
-            relative_reasons = ("相对强弱中性：本币与 BTC 表现差距不明显。",)
-
-    if symbol_return_24h is not None and btc_return_24h is not None:
-        relative_24h = symbol_return_24h - btc_return_24h
-        if candidate.direction == "做多观察":
-            if relative_24h <= -0.01:
-                return replace(
-                    candidate,
-                    score=min(candidate.score, 69),
-                    level="暂不关注",
-                    reasons=candidate.reasons
-                    + (
-                        f"24h相对强弱过滤：本币近24小时弱于 BTC {abs(relative_24h) * 100:.2f}%，做多只记录。",
-                    ),
-                )
-            if relative_24h >= 0.008:
-                relative_reasons += (f"24h相对强弱通过：本币强于 BTC {relative_24h * 100:.2f}%。",)
-        elif candidate.direction == "做空观察":
-            if relative_24h >= 0.01:
-                return replace(
-                    candidate,
-                    score=min(candidate.score, 69),
-                    level="暂不关注",
-                    reasons=candidate.reasons
-                    + (
-                        f"24h相对强弱过滤：本币近24小时强于 BTC {relative_24h * 100:.2f}%，做空只记录。",
-                    ),
-                )
-            if relative_24h <= -0.008:
-                relative_reasons += (f"24h相对强弱通过：本币弱于 BTC {abs(relative_24h) * 100:.2f}%。",)
-
-    if candidate.direction == "做多观察" and not regime.allows_long:
-        return replace(
-            candidate,
-            score=min(candidate.score, 59),
-            level="暂不关注",
-            reasons=candidate.reasons + (f"大盘过滤：{regime.detail} 非BTC做多备案作废。",),
-        )
-    if candidate.direction == "做空观察" and not regime.allows_short:
-        return replace(
-            candidate,
-            score=min(candidate.score, 59),
-            level="暂不关注",
-            reasons=candidate.reasons + (f"大盘过滤：{regime.detail} 非BTC做空备案作废。",),
-        )
-    bonus = 5 if regime.direction in {"偏强", "偏弱"} else 0
-    new_score = _clamp_score(candidate.score + bonus)
-    return replace(
-        candidate,
-        score=new_score,
-        level=_level(new_score),
-        reasons=candidate.reasons + (f"大盘过滤通过：{regime.detail}",) + relative_reasons,
-    )
+    # Prefer a direction that passes hard filters; otherwise fall back to best soft score for observation.
+    long_ok = long_candidate.hard_filter_passed
+    short_ok = short_candidate.hard_filter_passed
+    if long_ok and not short_ok:
+        return long_candidate
+    if short_ok and not long_ok:
+        return short_candidate
+    return long_candidate if long_candidate.score >= short_candidate.score else short_candidate
 
 
 def evaluate_observation_signal(
