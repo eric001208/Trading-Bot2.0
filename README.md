@@ -219,5 +219,4 @@ python main.py --run-live --loop-minutes 1 --paper-record --notify --breakout-co
 ```powershell
 python -m pytest -q
 ```
-#   T r a d i n g - B o t 2 . 0  
- 
+
